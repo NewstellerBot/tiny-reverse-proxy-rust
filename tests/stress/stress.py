@@ -1,31 +1,3 @@
-# import requests
-# import time
-
-
-# def measure_request_time(url):
-#     try:
-#         # Start the high-resolution timer
-#         start_time = time.perf_counter()
-
-#         # Send the GET request
-#         response = requests.get(url)
-
-#         # Stop the high-resolution timer
-#         end_time = time.perf_counter()
-
-#         # Calculate the elapsed time
-#         elapsed_time = end_time - start_time
-
-#         print(f"Request to {url} took {elapsed_time:.4f} seconds.")
-#         print(f"Status Code: {response.status_code}")
-#     except requests.exceptions.RequestException as e:
-#         print(f"An error occurred: {e}")
-
-
-# # Replace with the URL you want to test
-# url_to_test = "http://localhost:8000"
-# measure_request_time(url_to_test)
-
 import requests
 import time
 from concurrent.futures import ThreadPoolExecutor

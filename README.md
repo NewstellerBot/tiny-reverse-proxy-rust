@@ -64,4 +64,19 @@ cargo install cargo-tarpaulin
 cargo tarpaulin --out Html
 ```
 
+### Stress Testing 
+
+I have used the python script in `test/stress` to stress test the server. I haven't managed to fully take it down. The requests have never failed; however, the time needed to server one on average has incrased quite dramatically after 4k requests.
+
+![](assets/performance.png)
+
 Using the unit tests, we have managed to cover 98% of the codebase.
+
+## Video Tutorial
+
+[Loom Link](https://www.loom.com/share/eadc020be9994e5094bcfc5bf0706369?sid=e308bf2b-b88c-4cb3-9e46-add122082c65)
+
+## AI Policy
+
+I have used chatGPT for debugging code and finding language specific syntax. I have used copilot sporadically for autocompletion.
+
