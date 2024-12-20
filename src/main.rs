@@ -14,8 +14,9 @@ use router::Router;
 use thread_pool::ThreadPool;
 use utils::load_port_from_config;
 
-const THREAD_POOL_SIZE: usize = 4;
+const THREAD_POOL_SIZE: usize = 8;
 
+#[cfg(not(tarpaulin_include))]
 fn start_server(config_file: &str) -> std::io::Result<()> {
     let port = load_port_from_config(config_file).unwrap_or_else(|err| {
         eprintln!("Failed to load port from config: {}", err);
@@ -47,6 +48,7 @@ fn start_server(config_file: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(tarpaulin_include))]
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {

@@ -1,5 +1,3 @@
-// Mock router for testing purposes
-
 #[cfg(test)]
 mod tests {
     use std::{net::Shutdown, str, time::Duration};
