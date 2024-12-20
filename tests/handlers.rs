@@ -295,7 +295,7 @@ mod tests {
             let mut stream = TcpStream::connect(addr).expect("Failed to connect");
 
             // Send a request with a path that has no route in the mock router
-            let request = b"GET /invalid_path HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            let request = b"GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n";
             stream.write_all(request).expect("Failed to send request");
 
             // Wait for the response (should be an error response or no response)
@@ -318,7 +318,7 @@ mod tests {
         handle_client_request(
             client_connection,
             Arc::new(MockRouter {
-                mock_addresses: vec!["127.0.01:1".to_string()],
+                mock_addresses: vec!["127001:1".to_string()],
             }),
             request_counter,
         );
