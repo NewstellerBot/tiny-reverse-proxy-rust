@@ -314,6 +314,7 @@ mod tests {
             .expect("Failed to accept client connection");
         let request_counter = Arc::new(AtomicUsize::new(0));
 
+        println!("Handling client request!");
         // Call the function under test with an invalid path (router.get_servers returns None)
         handle_client_request(
             client_connection,
