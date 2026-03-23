@@ -8,7 +8,7 @@ use crate::evals::{
     ProjectEvalRunComparison, ProjectEvalRunComparisonGateRequest, ProjectEvalRunExecution,
     ProjectEvalRunRequest,
 };
-use crate::governance::{GovernanceState, ProviderHealthStats};
+use crate::governance::GovernanceState;
 use crate::prompt_cache::{PromptCache, PromptCacheStatusSnapshot};
 use crate::provider_failover::{
     FailedProviderStatus, ProviderConfig, ProviderFailover, ProviderFailureReason,
@@ -564,7 +564,7 @@ impl LlmGatewayApi {
                 .map(|name| {
                     let stats = governance
                         .map(|state| state.provider_health_stats(&name))
-                        .unwrap_or_else(ProviderHealthStats::default);
+                        .unwrap_or_default();
                     let cooldown_snapshot = failed_states
                         .get(&name)
                         .and_then(|status| Self::cooldown_snapshot(status, cooldown));

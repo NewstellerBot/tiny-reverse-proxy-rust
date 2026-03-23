@@ -43,6 +43,18 @@ mod tests {
         TestProxyConfig,
     };
 
+    type McpServerConfig<'a> = (&'a str, &'a str, Option<u64>, Option<u32>, Option<u32>);
+    type McpServerTimeBudgetConfig<'a> = (
+        &'a str,
+        &'a str,
+        Option<u64>,
+        Option<u32>,
+        Option<u32>,
+        Option<u64>,
+    );
+    type McpServerOutputBudgetConfig<'a> =
+        (&'a str, &'a str, Option<u64>, Option<u32>, Option<u64>);
+
     fn tool_runtime_config() -> Vec<PluginConfig> {
         vec![PluginConfig {
             name: "tool_runtime".into(),
@@ -126,7 +138,7 @@ mod tests {
     }
 
     fn tool_runtime_config_with_mcp_server_budget_options(
-        mcp_servers: &[(&str, &str, Option<u64>, Option<u32>, Option<u32>)],
+        mcp_servers: &[McpServerConfig<'_>],
     ) -> Vec<PluginConfig> {
         let mut config = toml::value::Map::new();
         if !mcp_servers.is_empty() {
@@ -165,14 +177,7 @@ mod tests {
     }
 
     fn tool_runtime_config_with_mcp_server_time_budget_options(
-        mcp_servers: &[(
-            &str,
-            &str,
-            Option<u64>,
-            Option<u32>,
-            Option<u32>,
-            Option<u64>,
-        )],
+        mcp_servers: &[McpServerTimeBudgetConfig<'_>],
     ) -> Vec<PluginConfig> {
         let mut config = toml::value::Map::new();
         if !mcp_servers.is_empty() {
@@ -219,7 +224,7 @@ mod tests {
     }
 
     fn tool_runtime_config_with_mcp_server_output_budget_options(
-        mcp_servers: &[(&str, &str, Option<u64>, Option<u32>, Option<u64>)],
+        mcp_servers: &[McpServerOutputBudgetConfig<'_>],
     ) -> Vec<PluginConfig> {
         let mut config = toml::value::Map::new();
         if !mcp_servers.is_empty() {

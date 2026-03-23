@@ -1198,15 +1198,7 @@ async fn scrub_text(
                 .regex
                 .replace_all(&output, |captures: &regex::Captures<'_>| {
                     let matched_text = captures.get(0).unwrap().as_str();
-                    if rule
-                        .allowlist_patterns
-                        .iter()
-                        .any(|pattern| pattern.is_match(matched_text))
-                    {
-                        matched_text.to_string()
-                    } else {
-                        matched_text.to_string()
-                    }
+                    matched_text.to_string()
                 })
                 .into_owned();
             let candidate_values = rule
@@ -1407,12 +1399,10 @@ fn parse_toml_string_array(value: Option<&toml::Value>) -> Option<Vec<String>> {
         return Some(Vec::new());
     };
     let array = value.as_array()?;
-    Some(
-        array
-            .iter()
-            .map(|entry| entry.as_str().map(ToString::to_string))
-            .collect::<Option<Vec<_>>>()?,
-    )
+    array
+        .iter()
+        .map(|entry| entry.as_str().map(ToString::to_string))
+        .collect::<Option<Vec<_>>>()
 }
 
 #[cfg(test)]

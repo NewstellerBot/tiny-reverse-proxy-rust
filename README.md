@@ -113,6 +113,14 @@ cargo test -p tiny-reverse-proxy --features plugin-llm-gateway gateway_virtual_k
 cargo test -p tiny-reverse-proxy --features plugin-llm-gateway gateway_virtual_key_responses_proxy_can_stream_text_response -- --ignored --nocapture
 ```
 
+### Releases
+
+Versions should be cut through the GitHub Actions `Release` workflow, not by
+creating tags manually. That workflow runs the live gateway `/v1/responses`
+smoke as a required gate before it creates the version tag and GitHub release.
+Configure the `release-live-openai` environment with the OpenAI secrets and
+required reviewers so the live smoke stays protected and explicit.
+
 ### Python Realtime Smoke Test
 
 For a standalone smoke test outside Rust's test harness:

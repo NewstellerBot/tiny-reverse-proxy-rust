@@ -40,6 +40,7 @@ mod tests {
 
     use plugin_llm_gateway::api::LlmGatewayApi;
     use plugin_llm_gateway::CreatePluginsOptions;
+    use serde_json::{json, Value};
 
     use trp_test_support::{
         catch_all_router, send_request, start_proxy_with_config, start_upstream,
@@ -908,28 +909,26 @@ mod tests {
         // GET failed providers — should be empty.
         let (status, body) = mgmt_get(mgmt_port, "/api/v1/providers/failed").await;
         assert_eq!(status, 200);
-        assert!(
-            body.contains("\"failed\":[]"),
-            "no failures initially: {}",
-            body
-        );
+        let failed: Value = serde_json::from_str(&body).expect("parse failed providers");
+        assert_eq!(failed["failed"], json!([]), "no failures initially: {body}");
 
         let (status, body) = mgmt_get(mgmt_port, "/api/v1/providers/health").await;
         assert_eq!(status, 200);
-        assert!(
-            body.contains("\"name\":\"openai\""),
-            "provider listed: {}",
-            body
+        let health: Value = serde_json::from_str(&body).expect("parse provider health");
+        let providers = health["providers"].as_array().expect("providers array");
+        let openai = providers
+            .iter()
+            .find(|provider| provider["name"] == "openai")
+            .expect("openai provider listed");
+        assert_eq!(
+            openai["eligible"],
+            json!(true),
+            "eligible by default: {body}"
         );
-        assert!(
-            body.contains("\"eligible\":true"),
-            "eligible by default: {}",
-            body
-        );
-        assert!(
-            body.contains("\"adaptive_penalty_total\":0.00"),
-            "health penalties start empty: {}",
-            body
+        assert_eq!(
+            openai["adaptive_penalty_total"],
+            json!(0.0),
+            "health penalties start empty: {body}"
         );
 
         // Clear a nonexistent failed provider returns 404.
@@ -1097,6 +1096,165 @@ mod tests {
             body.contains("\"name\":\"anthropic\"") && body.contains("\"eligible\":true"),
             "healthy provider surfaced: {}",
             body
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_management_api_escapes_provider_diagnostics_json() {
+        let debug_header_seen = Arc::new(AtomicUsize::new(0));
+        let failing_addr = start_upstream_async({
+            let debug_header_seen = Arc::clone(&debug_header_seen);
+            move |req: Request<Incoming>| {
+                let debug_header_seen = Arc::clone(&debug_header_seen);
+                async move {
+                    if req.headers().contains_key("x-trp-routing-debug") {
+                        debug_header_seen.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .header("content-type", "application/json")
+                        .body(Full::new(Bytes::from(
+                            r#"{"error":{"message":"rate limited"}}"#,
+                        )))
+                        .unwrap()
+                }
+            }
+        })
+        .await;
+
+        let provider_name = r#"odd"provider\name"#;
+        let providers = vec![canonical_provider(
+            provider_name,
+            "sk-openai-real",
+            format!("http://{}", failing_addr),
+            vec!["gpt-4".to_string()],
+            "authorization",
+            None,
+            ProviderFamily::OpenAi,
+            openai_tool_surfaces(),
+            ProviderRoutingMetadataConfig::default(),
+        )];
+
+        let (chain, api) = setup_plugins_with_virtual_keys_and_failover(
+            &providers,
+            &[(provider_name, &failing_addr)],
+        )
+        .await;
+        let mgmt_port = start_mgmt_server(api.clone()).await;
+
+        let router = catch_all_router(vec![format!("http://{}", failing_addr)]);
+        let proxy_addr = start_proxy_with_config(
+            router,
+            TestProxyConfig {
+                plugins: Some(chain),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let (plaintext_key, _) = api
+            .create_virtual_key(
+                Some("project-a"),
+                "routing-debug",
+                provider_name,
+                None,
+                None,
+                None,
+                None,
+                Some(vec!["gpt-4".to_string()]),
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", format!("Bearer {}", plaintext_key))
+            .header("content-type", "application/json")
+            .body(Full::new(Bytes::from(chat_request_body())))
+            .unwrap();
+        let resp = send_request(&proxy_addr, req).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let (status, body) = mgmt_get(mgmt_port, "/api/v1/providers/failed").await;
+        assert_eq!(status, 200);
+        let failed: Value = serde_json::from_str(&body).expect("parse failed providers");
+        let failed_entry = failed["failed"]
+            .as_array()
+            .and_then(|entries| entries.first())
+            .expect("failed provider entry");
+        assert_eq!(failed_entry["name"], json!(provider_name));
+        assert_eq!(failed_entry["reason"], json!("rate_limited"));
+
+        let (status, body) = mgmt_get(mgmt_port, "/api/v1/providers/health").await;
+        assert_eq!(status, 200);
+        let health: Value = serde_json::from_str(&body).expect("parse provider health");
+        let entry = health["providers"]
+            .as_array()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|provider| provider["name"] == json!(provider_name))
+            })
+            .expect("provider health entry");
+        assert_eq!(entry["name"], json!(provider_name));
+        assert_eq!(entry["cooldown_reason"], json!("rate_limited"));
+    }
+
+    #[tokio::test]
+    async fn routing_rule_management_auto_ids_do_not_collide_within_same_second() {
+        let (_chain, api) = setup_plugins_with_virtual_keys().await;
+        let mgmt_port = start_mgmt_server(api).await;
+
+        let current_second = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        while current_second
+            == std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        {
+            tokio::task::yield_now().await;
+        }
+
+        let (status, body) = mgmt_post(
+            mgmt_port,
+            "/api/v1/projects/project-a/routing-rules",
+            r#"{"name":"first rule","provider_order":["openai"]}"#,
+        )
+        .await;
+        assert_eq!(status, 201, "first create failed: {body}");
+
+        let (status, body) = mgmt_post(
+            mgmt_port,
+            "/api/v1/projects/project-a/routing-rules",
+            r#"{"name":"second rule","provider_order":["openai"]}"#,
+        )
+        .await;
+        assert_eq!(status, 201, "second create failed: {body}");
+
+        let (status, body) = mgmt_get(mgmt_port, "/api/v1/projects/project-a/routing-rules").await;
+        assert_eq!(status, 200);
+        let rules: Value = serde_json::from_str(&body).expect("parse routing rules");
+        let entries = rules["rules"].as_array().expect("rules array");
+        assert_eq!(
+            entries.len(),
+            2,
+            "expected both routing rules to persist: {body}"
+        );
+
+        let rule_ids: std::collections::BTreeSet<_> = entries
+            .iter()
+            .filter_map(|rule| rule["rule_id"].as_str())
+            .collect();
+        assert_eq!(
+            rule_ids.len(),
+            2,
+            "autogenerated rule IDs must stay unique even within the same second: {body}"
         );
     }
 

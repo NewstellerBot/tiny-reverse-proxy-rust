@@ -2,9 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::Duration;
 
     use bytes::Bytes;
     use http_body_util::BodyExt;
@@ -19,65 +17,10 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use trp_test_support::{
-        catch_all_router, send_request, start_proxy_with_config, TestProxyConfig,
+        catch_all_router, openai_api_key, openai_organization, openai_project,
+        openai_responses_model, openai_responses_timeout, send_request, start_proxy_with_config,
+        TestProxyConfig,
     };
-
-    fn repo_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|path| path.parent())
-            .unwrap()
-            .to_path_buf()
-    }
-
-    fn dotenv_env(name: &str) -> Option<String> {
-        let dotenv_path = repo_root().join(".env");
-        let dotenv = std::fs::read_to_string(dotenv_path).ok()?;
-
-        dotenv.lines().find_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                return None;
-            }
-
-            let (key, value) = trimmed.split_once('=')?;
-            if key.trim() != name {
-                return None;
-            }
-
-            Some(
-                value
-                    .trim()
-                    .trim_matches('"')
-                    .trim_matches('\'')
-                    .to_string(),
-            )
-        })
-    }
-
-    fn required_env(name: &str) -> String {
-        std::env::var(name)
-            .ok()
-            .or_else(|| dotenv_env(name))
-            .unwrap_or_else(|| panic!("{name} must be set to run the live gateway smoke tests"))
-    }
-
-    fn optional_env(names: &[&str]) -> Option<String> {
-        names
-            .iter()
-            .find_map(|name| std::env::var(name).ok().or_else(|| dotenv_env(name)))
-    }
-
-    fn responses_model() -> String {
-        optional_env(&["OPENAI_RESPONSES_MODEL"]).unwrap_or_else(|| "gpt-4.1-mini".to_string())
-    }
-
-    fn responses_timeout() -> Duration {
-        optional_env(&["OPENAI_RESPONSES_TIMEOUT_SECS"])
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(30))
-    }
 
     fn provider_config() -> ProviderKeyConfig {
         let family = ProviderFamilyConfig::OpenAi {
@@ -90,9 +33,9 @@ mod tests {
 
         ProviderKeyConfig {
             name: "openai-live".to_string(),
-            api_key: required_env("OPENAI_API_KEY"),
+            api_key: openai_api_key("run the live gateway smoke tests"),
             base_url: "https://api.openai.com".to_string(),
-            models: vec![responses_model()],
+            models: vec![openai_responses_model()],
             api_key_header: "authorization".to_string(),
             timeout_secs: None,
             family,
@@ -130,7 +73,7 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(vec![responses_model()]),
+                Some(vec![openai_responses_model()]),
                 None,
                 None,
                 None,
@@ -164,10 +107,10 @@ mod tests {
             .header("authorization", format!("Bearer {virtual_key}"))
             .header("content-type", "application/json");
 
-        if let Some(org) = optional_env(&["OPENAI_ORGANIZATION", "OPENAI_ORG_ID"]) {
+        if let Some(org) = openai_organization() {
             builder = builder.header("OpenAI-Organization", org);
         }
-        if let Some(project) = optional_env(&["OPENAI_PROJECT", "OPENAI_PROJECT_ID"]) {
+        if let Some(project) = openai_project() {
             builder = builder.header("OpenAI-Project", project);
         }
 
@@ -285,7 +228,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires OPENAI_API_KEY and live OpenAI Responses API access"]
     async fn gateway_virtual_key_responses_proxy_can_generate_text_response() {
-        let timeout = responses_timeout();
+        let timeout = openai_responses_timeout();
         let (proxy_addr, virtual_key, _temp_db) =
             tokio::time::timeout(timeout, setup_live_gateway())
                 .await
@@ -297,7 +240,7 @@ mod tests {
                 &proxy_addr,
                 &virtual_key,
                 json!({
-                    "model": responses_model(),
+                    "model": openai_responses_model(),
                     "input": "Reply with exactly PONG and nothing else."
                 }),
             ),
@@ -324,7 +267,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires OPENAI_API_KEY and live OpenAI Responses API access"]
     async fn gateway_virtual_key_responses_proxy_can_stream_text_response() {
-        let timeout = responses_timeout();
+        let timeout = openai_responses_timeout();
         let (proxy_addr, virtual_key, _temp_db) =
             tokio::time::timeout(timeout, setup_live_gateway())
                 .await
@@ -336,7 +279,7 @@ mod tests {
                 &proxy_addr,
                 &virtual_key,
                 json!({
-                    "model": responses_model(),
+                    "model": openai_responses_model(),
                     "input": "Reply with exactly PONG and nothing else.",
                     "stream": true
                 }),

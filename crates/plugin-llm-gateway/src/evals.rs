@@ -336,7 +336,7 @@ pub async fn compare_project_eval_runs(
         unchanged_items,
     };
     let gate = gate_request
-        .filter(|request| comparison_gate_requested(request))
+        .filter(comparison_gate_requested)
         .map(|request| evaluate_comparison_gate(&summary, &context, request));
 
     Ok(ProjectEvalRunComparison {
@@ -1820,7 +1820,7 @@ fn normalized_output_json(
     output_text.and_then(|text| serde_json::from_str::<Value>(text).ok())
 }
 
-fn extract_output_value<'a>(response_json: &'a Value) -> Option<&'a Value> {
+fn extract_output_value(response_json: &Value) -> Option<&Value> {
     if let Some(content) = response_json
         .get("choices")
         .and_then(Value::as_array)

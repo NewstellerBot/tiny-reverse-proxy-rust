@@ -43,7 +43,7 @@ pub(crate) enum PromptCacheScope {
 }
 
 impl PromptCacheScope {
-    fn as_str(self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::Auto => "auto",
             Self::System => "system",
@@ -128,7 +128,7 @@ impl PromptCacheRouteMutation {
 }
 
 impl PromptCacheRouteSignalKind {
-    fn as_str(self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             Self::Warm => "warm",
             Self::Negative => "negative",
@@ -643,9 +643,8 @@ impl PromptCache {
             .and_then(|value| value.as_str())
             .map(|value| {
                 PromptCacheScope::parse(value).ok_or_else(|| {
-                    format!(
-                        "prompt_cache.anthropic_default_scope must be one of: auto, system, tools, messages"
-                    )
+                    "prompt_cache.anthropic_default_scope must be one of: auto, system, tools, messages"
+                        .to_string()
                 })
             })
             .transpose()?

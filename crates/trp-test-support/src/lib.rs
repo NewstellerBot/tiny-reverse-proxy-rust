@@ -1,6 +1,9 @@
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
@@ -20,6 +23,97 @@ use proxy_core::metrics::Metrics;
 use proxy_core::plugin::PluginChain;
 use proxy_core::rate_limit::RateLimiter;
 use proxy_core::router::PathResolution;
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .unwrap()
+        .to_path_buf()
+}
+
+fn dotenv_contents() -> Option<&'static str> {
+    static DOTENV: OnceLock<Option<String>> = OnceLock::new();
+    DOTENV
+        .get_or_init(|| std::fs::read_to_string(repo_root().join(".env")).ok())
+        .as_deref()
+}
+
+fn parse_dotenv_var(dotenv: &str, name: &str) -> Option<String> {
+    dotenv.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return None;
+        }
+
+        let (key, value) = trimmed.split_once('=')?;
+        if key.trim() != name {
+            return None;
+        }
+
+        Some(
+            value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string(),
+        )
+    })
+}
+
+pub fn repo_root_dotenv_env(name: &str) -> Option<String> {
+    dotenv_contents().and_then(|dotenv| parse_dotenv_var(dotenv, name))
+}
+
+pub fn required_test_env(name: &str, reason: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .or_else(|| repo_root_dotenv_env(name))
+        .unwrap_or_else(|| panic!("{name} must be set to {reason}"))
+}
+
+pub fn optional_test_env(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .or_else(|| repo_root_dotenv_env(name))
+    })
+}
+
+fn optional_duration_env(names: &[&str], default_secs: u64) -> Duration {
+    optional_test_env(names)
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(default_secs))
+}
+
+pub fn openai_api_key(reason: &str) -> String {
+    required_test_env("OPENAI_API_KEY", reason)
+}
+
+pub fn openai_organization() -> Option<String> {
+    optional_test_env(&["OPENAI_ORGANIZATION", "OPENAI_ORG_ID"])
+}
+
+pub fn openai_project() -> Option<String> {
+    optional_test_env(&["OPENAI_PROJECT", "OPENAI_PROJECT_ID"])
+}
+
+pub fn openai_realtime_model() -> String {
+    optional_test_env(&["OPENAI_REALTIME_MODEL"]).unwrap_or_else(|| "gpt-realtime".to_string())
+}
+
+pub fn openai_realtime_timeout() -> Duration {
+    optional_duration_env(&["OPENAI_REALTIME_TIMEOUT_SECS"], 20)
+}
+
+pub fn openai_responses_model() -> String {
+    optional_test_env(&["OPENAI_RESPONSES_MODEL"]).unwrap_or_else(|| "gpt-4.1-mini".to_string())
+}
+
+pub fn openai_responses_timeout() -> Duration {
+    optional_duration_env(&["OPENAI_RESPONSES_TIMEOUT_SECS"], 30)
+}
 
 pub fn create_temp_config(content: &str) -> NamedTempFile {
     let mut temp_file = NamedTempFile::new().unwrap();
@@ -271,4 +365,33 @@ pub async fn get(proxy_addr: &str, path: &str) -> (StatusCode, String) {
     let status = resp.status();
     let body = resp.collect().await.unwrap().to_bytes();
     (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_dotenv_var;
+
+    #[test]
+    fn parse_dotenv_var_ignores_comments_and_quotes() {
+        let dotenv = r#"
+        # ignored
+        OPENAI_API_KEY="sk-test"
+        OPENAI_PROJECT='proj-123'
+        "#;
+
+        assert_eq!(
+            parse_dotenv_var(dotenv, "OPENAI_API_KEY").as_deref(),
+            Some("sk-test")
+        );
+        assert_eq!(
+            parse_dotenv_var(dotenv, "OPENAI_PROJECT").as_deref(),
+            Some("proj-123")
+        );
+    }
+
+    #[test]
+    fn parse_dotenv_var_returns_none_for_missing_names() {
+        let dotenv = "OPENAI_API_KEY=sk-test";
+        assert!(parse_dotenv_var(dotenv, "OPENAI_ORG_ID").is_none());
+    }
 }

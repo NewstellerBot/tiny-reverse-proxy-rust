@@ -597,7 +597,7 @@ pub fn extract_model(body: &[u8]) -> Option<String> {
     None
 }
 
-pub(crate) fn cached_request_json<'a>(ctx: &'a mut RequestContext) -> Option<&'a Value> {
+pub(crate) fn cached_request_json(ctx: &mut RequestContext) -> Option<&Value> {
     if !ensure_cached_request_json(ctx) {
         return None;
     }
@@ -606,7 +606,7 @@ pub(crate) fn cached_request_json<'a>(ctx: &'a mut RequestContext) -> Option<&'a
         .map(|cached| &cached.value)
 }
 
-pub(crate) fn cached_request_json_mut<'a>(ctx: &'a mut RequestContext) -> Option<&'a mut Value> {
+pub(crate) fn cached_request_json_mut(ctx: &mut RequestContext) -> Option<&mut Value> {
     if !ensure_cached_request_json(ctx) {
         return None;
     }

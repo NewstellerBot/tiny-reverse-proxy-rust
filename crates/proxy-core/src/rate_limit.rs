@@ -98,6 +98,10 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> TokenBucketMap<K> {
         self.buckets.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+    }
+
     /// Rate per second for each bucket.
     pub fn rate(&self) -> f64 {
         self.rate

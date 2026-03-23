@@ -1844,12 +1844,9 @@ impl ToolRuntime {
             .mcp_servers
             .get(server_name)
             .ok_or_else(|| format!("unknown mcp server '{}'", server_name))?;
-        let state = match self
+        let state = self
             .discover_mcp_server(server_name, server, Some(&current))
-            .await
-        {
-            state => state,
-        };
+            .await;
         let mut inventory = self
             .mcp_inventory
             .write()
@@ -2650,15 +2647,14 @@ impl ToolRuntime {
                         timeout,
                     )
                     .await
-                    .map_err(|error| {
+                    .inspect_err(|error| {
                         self.record_mcp_tool_call_failed(
                             &config.server,
                             &tool.tool_name,
-                            &error,
+                            error,
                             None,
                             retry_count,
                         );
-                        error
                     })?;
                     send_mcp_initialized_notification_sse(
                         &config.server,
@@ -2667,15 +2663,14 @@ impl ToolRuntime {
                         timeout,
                     )
                     .await
-                    .map_err(|error| {
+                    .inspect_err(|error| {
                         self.record_mcp_tool_call_failed(
                             &config.server,
                             &tool.tool_name,
-                            &error,
+                            error,
                             None,
                             retry_count,
                         );
-                        error
                     })?;
                     let response = send_mcp_sse_jsonrpc_request(
                         server,
@@ -2692,15 +2687,14 @@ impl ToolRuntime {
                         timeout,
                     )
                     .await
-                    .map_err(|error| {
+                    .inspect_err(|error| {
                         self.record_mcp_tool_call_failed(
                             &config.server,
                             &tool.tool_name,
-                            &error,
+                            error,
                             None,
                             retry_count,
                         );
-                        error
                     })?;
                     retry_count += response.retry_count;
                     response
@@ -2734,15 +2728,14 @@ impl ToolRuntime {
                         timeout,
                     )
                     .await
-                    .map_err(|error| {
+                    .inspect_err(|error| {
                         self.record_mcp_tool_call_failed(
                             &config.server,
                             &tool.tool_name,
-                            &error,
+                            error,
                             None,
                             retry_count,
                         );
-                        error
                     })?;
                     response
                 }
@@ -5452,6 +5445,7 @@ fn parse_allowed_tools_array(value: &Value) -> Result<Vec<String>, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use proxy_core::config::{

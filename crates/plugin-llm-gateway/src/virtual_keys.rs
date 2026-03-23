@@ -57,17 +57,12 @@ pub struct VirtualKeyMeta {
     pub allowed_tools: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum ToolApprovalMode {
+    #[default]
     AllowAll,
     DenyAll,
     AllowList,
-}
-
-impl Default for ToolApprovalMode {
-    fn default() -> Self {
-        Self::AllowAll
-    }
 }
 
 impl ToolApprovalMode {
@@ -885,12 +880,9 @@ impl ProviderCapabilityRequirements {
     }
 
     fn first_missing_for(&self, provider: &ProviderKeyConfig) -> Option<ProviderExtraCapability> {
-        for capability in self.required_capabilities() {
-            if !provider.supports_capability(capability) {
-                return Some(capability);
-            }
-        }
-        None
+        self.required_capabilities()
+            .into_iter()
+            .find(|&capability| !provider.supports_capability(capability))
     }
 
     fn first_required_capability(&self) -> Option<ProviderExtraCapability> {
@@ -1290,7 +1282,7 @@ impl VirtualKeys {
             for model in &provider.models {
                 self.model_to_provider
                     .entry(model.clone())
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(provider.name.clone());
             }
             self.providers.insert(provider.name.clone(), provider);
@@ -4754,7 +4746,7 @@ mod tests {
                 "openai",
                 "sk-real-openai-key",
                 "https://api.openai.com",
-                &["gpt-4o", "gpt-4o-mini"],
+                ["gpt-4o", "gpt-4o-mini"],
                 "authorization",
                 ProviderFamily::OpenAi,
                 openai_surfaces(),
@@ -4763,7 +4755,7 @@ mod tests {
                 "anthropic",
                 "sk-ant-real-key",
                 "https://api.anthropic.com",
-                &["claude-sonnet-4-20250514"],
+                ["claude-sonnet-4-20250514"],
                 "x-api-key",
                 ProviderFamily::Anthropic,
                 anthropic_surfaces(),
@@ -4980,7 +4972,7 @@ mod tests {
                 "openai-chat",
                 "sk-openai",
                 "https://api.openai.com",
-                &["gpt-4o"],
+                ["gpt-4o"],
                 "authorization",
                 ProviderFamily::OpenAi,
                 openai_surfaces(),
@@ -4989,7 +4981,7 @@ mod tests {
                 "openai-responses",
                 "sk-openai-responses",
                 "https://responses.example.com",
-                &["gpt-4o"],
+                ["gpt-4o"],
                 "authorization",
                 ProviderFamily::OpenAi,
                 ProviderSurfaceCatalog {
@@ -6307,7 +6299,7 @@ mod tests {
                 "openai",
                 "sk-openai",
                 "https://api.openai.com",
-                &["gpt-4o"],
+                ["gpt-4o"],
                 "authorization",
                 ProviderFamily::OpenAi,
                 openai_surfaces(),
@@ -6316,7 +6308,7 @@ mod tests {
                 "azure-openai",
                 "sk-azure",
                 "https://my-instance.openai.azure.com",
-                &["gpt-4o"],
+                ["gpt-4o"],
                 "authorization",
                 ProviderFamily::OpenAi,
                 openai_surfaces(),
@@ -6336,7 +6328,7 @@ mod tests {
                 "openai",
                 "sk-openai",
                 "https://api.openai.com",
-                &["gpt-4o"],
+                ["gpt-4o"],
                 "authorization",
                 ProviderFamily::OpenAi,
                 openai_surfaces(),
@@ -6345,7 +6337,7 @@ mod tests {
                 "azure-openai",
                 "sk-azure",
                 "https://my-instance.openai.azure.com",
-                &["gpt-4o"],
+                ["gpt-4o"],
                 "authorization",
                 ProviderFamily::OpenAi,
                 openai_surfaces(),
@@ -6393,7 +6385,7 @@ mod tests {
                 "openai",
                 "sk-openai-real",
                 "https://api.openai.com",
-                &["gpt-4o"],
+                ["gpt-4o"],
                 "authorization",
                 ProviderFamily::OpenAi,
                 openai_surfaces(),
@@ -6402,7 +6394,7 @@ mod tests {
                 "anthropic",
                 "sk-ant-real",
                 "https://api.anthropic.com",
-                &["gpt-4o"],
+                ["gpt-4o"],
                 "x-api-key",
                 ProviderFamily::Anthropic,
                 anthropic_surfaces(),
@@ -6595,7 +6587,7 @@ mod tests {
                 "openai",
                 "sk-openai",
                 "https://api.openai.test",
-                &["gpt-4o"],
+                ["gpt-4o"],
                 "authorization",
                 ProviderFamily::OpenAi,
                 openai_surfaces(),
@@ -6604,7 +6596,7 @@ mod tests {
                 "anthropic",
                 "sk-anthropic",
                 "https://api.anthropic.test",
-                &["gpt-4o"],
+                ["gpt-4o"],
                 "x-api-key",
                 ProviderFamily::Anthropic,
                 anthropic_surfaces(),
@@ -7083,7 +7075,7 @@ mod tests {
                 "basic",
                 "sk-basic",
                 "https://api.basic.test",
-                &["gpt-4o"],
+                ["gpt-4o"],
                 "authorization",
                 ProviderFamily::Custom,
                 ProviderSurfaceCatalog::default(),
@@ -7092,7 +7084,7 @@ mod tests {
                 "tools",
                 "sk-tools",
                 "https://api.tools.test",
-                &["gpt-4o"],
+                ["gpt-4o"],
                 "authorization",
                 ProviderFamily::OpenAi,
                 openai_surfaces(),

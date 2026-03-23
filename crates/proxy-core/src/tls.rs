@@ -118,7 +118,7 @@ fn der_to_pem(label: &str, der: &[u8]) -> String {
     // Simple base64 encoder (RFC 4648)
     const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-    let mut b64 = String::with_capacity((der.len() + 2) / 3 * 4);
+    let mut b64 = String::with_capacity(der.len().div_ceil(3) * 4);
     let mut i = 0;
     while i < der.len() {
         let remaining = der.len() - i;

@@ -131,7 +131,7 @@ mod tests {
     #[tokio::test]
     async fn returns_503_when_all_upstreams_unhealthy() {
         let upstream_addr = start_healthy_upstream().await;
-        let health_state = HealthState::new(&[upstream_addr.clone()]);
+        let health_state = HealthState::new(std::slice::from_ref(&upstream_addr));
 
         // Mark the upstream as unhealthy.
         health_state.mark_unhealthy(&upstream_addr);
@@ -180,7 +180,7 @@ mod tests {
     #[tokio::test]
     async fn healthy_upstream_serves_traffic() {
         let upstream = start_healthy_upstream().await;
-        let health_state = HealthState::new(&[upstream.clone()]);
+        let health_state = HealthState::new(std::slice::from_ref(&upstream));
         // Upstream starts healthy.
 
         let router = Arc::new(CatchAllRouter {
@@ -200,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_after_marking_healthy() {
         let upstream = start_healthy_upstream().await;
-        let health_state = HealthState::new(&[upstream.clone()]);
+        let health_state = HealthState::new(std::slice::from_ref(&upstream));
 
         // Mark unhealthy, then recover.
         health_state.mark_unhealthy(&upstream);

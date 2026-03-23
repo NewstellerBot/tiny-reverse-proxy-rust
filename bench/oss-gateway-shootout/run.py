@@ -312,6 +312,39 @@ def mock_gateway_upstream(path: str = "") -> str:
 
 
 def make_tiny_proxy_config_for_scenario(scenario: str) -> str:
+    def canonical_openai_provider_block(
+        name: str,
+        base_url: str,
+        *,
+        prompt_cache: bool = False,
+        tools: bool = False,
+    ) -> str:
+        lines = [
+            "[[providers]]",
+            f'name = "{name}"',
+            'api_key = "sk-benchmark-upstream"',
+            f'base_url = "{base_url}"',
+            'models = ["benchmark-model"]',
+            'family = "openai"',
+            "",
+            "[providers.surfaces]",
+            'responses = "openai_compatible"',
+            'files = "openai_compatible"',
+            'batches = "openai_compatible"',
+        ]
+        if tools:
+            lines.append('tools = "openai"')
+        if prompt_cache:
+            lines.extend(
+                [
+                    "",
+                    "[providers.surfaces.prompt_cache]",
+                    'protocol = "openai"',
+                    'request_controls = true',
+                ]
+            )
+        return "\n".join(lines)
+
     if scenario in PROMPT_CACHE_AFFINITY_SCENARIOS:
         return textwrap.dedent(
             f"""
@@ -323,19 +356,17 @@ def make_tiny_proxy_config_for_scenario(scenario: str) -> str:
             [paths]
             "/**" = ["{MOCK_GATEWAY_HOST}:{MOCK_HOST_PORT}"]
 
-            [[providers]]
-            name = "alpha"
-            api_key = "sk-benchmark-upstream"
-            base_url = "{mock_gateway_upstream('/alpha')}"
-            models = ["benchmark-model"]
-            capabilities = ["prompt_cache_openai", "prompt_cache_request_controls"]
+            {canonical_openai_provider_block(
+                "alpha",
+                mock_gateway_upstream('/alpha'),
+                prompt_cache=True,
+            )}
 
-            [[providers]]
-            name = "beta"
-            api_key = "sk-benchmark-upstream"
-            base_url = "{mock_gateway_upstream('/beta')}"
-            models = ["benchmark-model"]
-            capabilities = ["prompt_cache_openai", "prompt_cache_request_controls"]
+            {canonical_openai_provider_block(
+                "beta",
+                mock_gateway_upstream('/beta'),
+                prompt_cache=True,
+            )}
 
             [[plugins]]
             name = "prompt_cache"
@@ -357,17 +388,9 @@ def make_tiny_proxy_config_for_scenario(scenario: str) -> str:
             [paths]
             "/**" = ["{MOCK_GATEWAY_HOST}:{MOCK_HOST_PORT}"]
 
-            [[providers]]
-            name = "alpha"
-            api_key = "sk-benchmark-upstream"
-            base_url = "{mock_gateway_upstream('/alpha')}"
-            models = ["benchmark-model"]
+            {canonical_openai_provider_block("alpha", mock_gateway_upstream('/alpha'))}
 
-            [[providers]]
-            name = "beta"
-            api_key = "sk-benchmark-upstream"
-            base_url = "{mock_gateway_upstream('/beta')}"
-            models = ["benchmark-model"]
+            {canonical_openai_provider_block("beta", mock_gateway_upstream('/beta'))}
 
             [[plugins]]
             name = "semantic_cache"
@@ -390,12 +413,11 @@ def make_tiny_proxy_config_for_scenario(scenario: str) -> str:
             [paths]
             "/**" = ["{MOCK_GATEWAY_HOST}:{MOCK_HOST_PORT}"]
 
-            [[providers]]
-            name = "openai"
-            api_key = "sk-benchmark-upstream"
-            base_url = "{mock_gateway_upstream()}"
-            models = ["benchmark-model"]
-            capabilities = ["prompt_cache_openai", "prompt_cache_request_controls"]
+            {canonical_openai_provider_block(
+                "openai",
+                mock_gateway_upstream(),
+                prompt_cache=True,
+            )}
 
             [[plugins]]
             name = "prompt_cache"
@@ -416,12 +438,11 @@ def make_tiny_proxy_config_for_scenario(scenario: str) -> str:
             [paths]
             "/**" = ["{MOCK_GATEWAY_HOST}:{MOCK_HOST_PORT}"]
 
-            [[providers]]
-            name = "openai"
-            api_key = "sk-benchmark-upstream"
-            base_url = "{mock_gateway_upstream()}"
-            models = ["benchmark-model"]
-            tool_protocol = "openai"
+            {canonical_openai_provider_block(
+                "openai",
+                mock_gateway_upstream(),
+                tools=True,
+            )}
 
             [[plugins]]
             name = "tool_runtime"

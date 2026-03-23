@@ -74,10 +74,16 @@ impl SemanticSafetyGrpcService {
     }
 
     pub async fn load_from_store(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut compiled_indexes = Vec::new();
         for record in self.store.load_all()? {
             let compiled = self
                 .compile_policy(record.policy, Some(record.exemplar_embeddings))
                 .await?;
+            compiled_indexes.push(compiled);
+        }
+
+        self.indexes.clear();
+        for compiled in compiled_indexes {
             self.indexes
                 .insert(compiled.policy.project_id.clone(), compiled);
         }
@@ -146,6 +152,10 @@ impl SemanticSafetyGrpcService {
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "gRPC authorization failures are returned as tonic::Status"
+    )]
     fn authorize<T>(&self, request: &Request<T>) -> Result<(), Status> {
         if let Some(expected) = &self.config.auth_token {
             let actual = request
@@ -352,6 +362,22 @@ impl SemanticSafetyService for SemanticSafetyGrpcService {
                 )));
             }
         };
+        if embeddings.len() != payload.chunks.len() {
+            self.observe_evaluate("degraded", started);
+            return Ok(Response::new(Self::build_evaluate_response(
+                started,
+                index.policy.project_id.clone(),
+                index.policy.version.clone(),
+                Vec::new(),
+                IndexState::Degraded,
+                format!(
+                    "embedding count mismatch: expected {} embeddings for {} chunks, got {}",
+                    payload.chunks.len(),
+                    payload.chunks.len(),
+                    embeddings.len()
+                ),
+            )));
+        }
 
         let mut findings = Vec::new();
         for (chunk, embedding) in payload.chunks.iter().zip(embeddings.iter()) {
@@ -587,6 +613,9 @@ mod tests {
         rerank_calls: AtomicUsize,
     }
 
+    #[derive(Default)]
+    struct ShortEmbeddingBackend;
+
     #[async_trait]
     impl InferenceBackend for FailingBackend {
         async fn embed_texts(
@@ -645,6 +674,36 @@ mod tests {
                 ready: true,
                 backend: "counting",
                 message: "counting backend ready".to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl InferenceBackend for ShortEmbeddingBackend {
+        async fn embed_texts(
+            &self,
+            _texts: &[String],
+        ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(vec![vec![1.0, 0.0]])
+        }
+
+        async fn rerank(
+            &self,
+            _query: &str,
+            _candidates: &[String],
+        ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(vec![0.5])
+        }
+
+        fn backend_name(&self) -> &'static str {
+            "short"
+        }
+
+        fn health(&self) -> BackendHealth {
+            BackendHealth {
+                ready: true,
+                backend: "short",
+                message: "short backend ready".to_string(),
             }
         }
     }
@@ -803,6 +862,52 @@ mod tests {
         assert_eq!(response.index_state, IndexState::Degraded as i32);
         assert!(response.findings.is_empty());
         assert!(response.degraded_reason.contains("rerank failed"));
+    }
+
+    #[tokio::test]
+    async fn evaluate_returns_degraded_response_when_backend_embedding_count_mismatches() {
+        let dir = tempdir().unwrap();
+        let service = SemanticSafetyGrpcService::new(
+            SemanticSafetyConfig { auth_token: None },
+            Arc::new(FileProjectIndexStore::new(dir.path().to_path_buf()).unwrap()),
+            Arc::new(ShortEmbeddingBackend),
+        );
+        service
+            .upsert_project_policy(Request::new(UpsertProjectPolicyRequest {
+                policy: Some(sample_policy()),
+            }))
+            .await
+            .unwrap();
+
+        let response = service
+            .evaluate(Request::new(EvaluateRequest {
+                project_id: "project-a".to_string(),
+                policy_version: "1".to_string(),
+                request_id: "req-embedding-mismatch".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                model: "gpt-4o".to_string(),
+                streaming: false,
+                chunks: vec![
+                    Chunk {
+                        path: "$.messages[0].content".to_string(),
+                        text: "Something is happening at Company X".to_string(),
+                    },
+                    Chunk {
+                        path: "$.messages[1].content".to_string(),
+                        text: "Layoffs next week".to_string(),
+                    },
+                ],
+                top_k: 3,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(response.index_state, IndexState::Degraded as i32);
+        assert!(response.findings.is_empty());
+        assert!(response
+            .degraded_reason
+            .contains("embedding count mismatch"));
     }
 
     #[tokio::test]

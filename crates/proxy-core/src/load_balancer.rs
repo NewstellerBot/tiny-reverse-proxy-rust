@@ -26,6 +26,12 @@ impl RoundRobin {
     }
 }
 
+impl Default for RoundRobin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LoadBalancer for RoundRobin {
     fn pick(&self, servers: &[&String], _key: Option<&str>) -> usize {
         if servers.is_empty() {
@@ -47,6 +53,12 @@ impl LeastConnections {
         Self {
             connections: DashMap::new(),
         }
+    }
+}
+
+impl Default for LeastConnections {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -92,6 +104,12 @@ impl ConsistentHash {
     }
 }
 
+impl Default for ConsistentHash {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LoadBalancer for ConsistentHash {
     fn pick(&self, servers: &[&String], key: Option<&str>) -> usize {
         if servers.is_empty() {
@@ -110,8 +128,6 @@ impl LoadBalancer for ConsistentHash {
 /// Weighted round-robin load balancer.
 pub struct WeightedRoundRobin {
     counter: AtomicUsize,
-    #[allow(dead_code)]
-    weights: Vec<u32>,
     expanded: Vec<usize>, // expanded index list based on weights
 }
 
@@ -128,7 +144,6 @@ impl WeightedRoundRobin {
         }
         Self {
             counter: AtomicUsize::new(0),
-            weights,
             expanded,
         }
     }

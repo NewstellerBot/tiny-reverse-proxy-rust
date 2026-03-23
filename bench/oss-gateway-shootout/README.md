@@ -35,6 +35,8 @@ open source LLM gateways under the same Docker resource limits.
   so the benchmark focuses on proxying work instead of stdout overhead.
 - Results include the generated gateway config files so the comparison is
   auditable.
+- Generated `tiny-proxy` configs use canonical `family` + `surfaces` provider
+  definitions, not the old flat compatibility fields.
 
 The harness now supports seven scenarios:
 

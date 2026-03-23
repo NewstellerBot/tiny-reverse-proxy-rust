@@ -597,10 +597,11 @@ async fn start_server(config_file: &str) -> std::io::Result<()> {
         match (&config.tls_cert, &config.tls_key) {
             (Some(cert_path), Some(key_path)) => {
                 // Load certs from PEM files for both TLS and QUIC.
-                let (certs, key) = tls::load_tls_material(cert_path, key_path).unwrap_or_else(|e| {
-                    tracing::error!("Failed to load TLS material: {}", e);
-                    exit(1);
-                });
+                let (certs, key) =
+                    tls::load_tls_material(cert_path, key_path).unwrap_or_else(|e| {
+                        tracing::error!("Failed to load TLS material: {}", e);
+                        exit(1);
+                    });
 
                 let quic_certs = certs.clone();
                 let quic_key = key.clone_key();
@@ -910,12 +911,15 @@ mod tests {
     use proxy_core::config::{LbStrategy, RouteConfig};
     use proxy_core::router::PathResolution;
     use serde_json::{json, Value};
-    use std::path::PathBuf;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::{http::StatusCode as WsStatusCode, Message};
     use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+    use trp_test_support::{
+        openai_api_key, openai_organization, openai_project, openai_realtime_model,
+        openai_realtime_timeout, openai_responses_model, openai_responses_timeout,
+    };
 
     type LiveWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -950,69 +954,6 @@ mod tests {
         });
 
         addr
-    }
-
-    fn repo_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|path| path.parent())
-            .unwrap()
-            .to_path_buf()
-    }
-
-    fn dotenv_env(name: &str) -> Option<String> {
-        let dotenv_path = repo_root().join(".env");
-        let dotenv = std::fs::read_to_string(dotenv_path).ok()?;
-
-        dotenv.lines().find_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                return None;
-            }
-
-            let (key, value) = trimmed.split_once('=')?;
-            if key.trim() != name {
-                return None;
-            }
-
-            let value = value.trim().trim_matches('"').trim_matches('\'');
-            Some(value.to_string())
-        })
-    }
-
-    fn required_env(name: &str) -> String {
-        std::env::var(name)
-            .ok()
-            .or_else(|| dotenv_env(name))
-            .unwrap_or_else(|| panic!("{name} must be set to run the live OpenAI smoke tests"))
-    }
-
-    fn optional_env(names: &[&str]) -> Option<String> {
-        names
-            .iter()
-            .find_map(|name| std::env::var(name).ok().or_else(|| dotenv_env(name)))
-    }
-
-    fn realtime_model() -> String {
-        optional_env(&["OPENAI_REALTIME_MODEL"]).unwrap_or_else(|| "gpt-realtime".to_string())
-    }
-
-    fn realtime_timeout() -> Duration {
-        optional_env(&["OPENAI_REALTIME_TIMEOUT_SECS"])
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(20))
-    }
-
-    fn responses_model() -> String {
-        optional_env(&["OPENAI_RESPONSES_MODEL"]).unwrap_or_else(|| "gpt-4.1-mini".to_string())
-    }
-
-    fn responses_timeout() -> Duration {
-        optional_env(&["OPENAI_RESPONSES_TIMEOUT_SECS"])
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .map(Duration::from_secs)
-            .unwrap_or_else(|| Duration::from_secs(30))
     }
 
     fn request_id(prefix: &str) -> String {
@@ -1069,8 +1010,8 @@ mod tests {
     }
 
     async fn connect_openai_realtime_proxy(proxy_addr: SocketAddr) -> LiveWs {
-        let api_key = required_env("OPENAI_API_KEY");
-        let model = realtime_model();
+        let api_key = openai_api_key("run the live OpenAI smoke tests");
+        let model = openai_realtime_model();
         let url = format!("ws://{proxy_addr}/v1/realtime?model={model}");
         let mut request = url.into_client_request().unwrap();
         request.headers_mut().insert(
@@ -1078,12 +1019,12 @@ mod tests {
             format!("Bearer {api_key}").parse().unwrap(),
         );
 
-        if let Some(org) = optional_env(&["OPENAI_ORGANIZATION", "OPENAI_ORG_ID"]) {
+        if let Some(org) = openai_organization() {
             request
                 .headers_mut()
                 .insert("OpenAI-Organization", org.parse().unwrap());
         }
-        if let Some(project) = optional_env(&["OPENAI_PROJECT", "OPENAI_PROJECT_ID"]) {
+        if let Some(project) = openai_project() {
             request
                 .headers_mut()
                 .insert("OpenAI-Project", project.parse().unwrap());
@@ -1104,7 +1045,7 @@ mod tests {
         path: &str,
         body_json: Value,
     ) -> Response<Incoming> {
-        let api_key = required_env("OPENAI_API_KEY");
+        let api_key = openai_api_key("run the live OpenAI smoke tests");
         let client = build_client();
         let mut builder = Request::builder()
             .method("POST")
@@ -1113,10 +1054,10 @@ mod tests {
             .header(CONTENT_TYPE, "application/json")
             .header("X-Client-Request-Id", request_id("trp-http"));
 
-        if let Some(org) = optional_env(&["OPENAI_ORGANIZATION", "OPENAI_ORG_ID"]) {
+        if let Some(org) = openai_organization() {
             builder = builder.header("OpenAI-Organization", org);
         }
-        if let Some(project) = optional_env(&["OPENAI_PROJECT", "OPENAI_PROJECT_ID"]) {
+        if let Some(project) = openai_project() {
             builder = builder.header("OpenAI-Project", project);
         }
 
@@ -1308,7 +1249,7 @@ mod tests {
                 panic!("Realtime API returned an error event: {}", event);
             }
 
-            if expected.iter().any(|candidate| *candidate == event_type) {
+            if expected.contains(&event_type) {
                 return event;
             }
         }
@@ -1711,7 +1652,7 @@ mod tests {
         let mut ws = connect_openai_realtime_proxy(proxy_addr).await;
 
         let session_created =
-            wait_for_event_type(&mut ws, "session.created", realtime_timeout()).await;
+            wait_for_event_type(&mut ws, "session.created", openai_realtime_timeout()).await;
         assert!(
             session_created.get("session").is_some(),
             "session.created must include session payload: {}",
@@ -1727,7 +1668,7 @@ mod tests {
     async fn openai_realtime_proxy_can_generate_text_response() {
         let (proxy_addr, shutdown_tx) = start_openai_proxy().await;
         let mut ws = connect_openai_realtime_proxy(proxy_addr).await;
-        let timeout = realtime_timeout();
+        let timeout = openai_realtime_timeout();
 
         let _ = wait_for_event_type(&mut ws, "session.created", timeout).await;
 
@@ -1740,8 +1681,7 @@ mod tests {
                     "output_modalities": ["text"]
                 }
             })
-            .to_string()
-            .into(),
+            .to_string(),
         ))
         .await
         .unwrap();
@@ -1761,8 +1701,7 @@ mod tests {
                     ]
                 }
             })
-            .to_string()
-            .into(),
+            .to_string(),
         ))
         .await
         .unwrap();
@@ -1785,8 +1724,7 @@ mod tests {
                     "output_modalities": ["text"]
                 }
             })
-            .to_string()
-            .into(),
+            .to_string(),
         ))
         .await
         .unwrap();
@@ -1806,7 +1744,7 @@ mod tests {
     #[ignore = "requires OPENAI_API_KEY and live OpenAI Responses API access"]
     async fn openai_responses_proxy_can_generate_text_response() {
         let (proxy_addr, shutdown_tx) = start_openai_proxy().await;
-        let timeout = responses_timeout();
+        let timeout = openai_responses_timeout();
 
         let response = tokio::time::timeout(
             timeout,
@@ -1814,7 +1752,7 @@ mod tests {
                 proxy_addr,
                 "/v1/responses",
                 json!({
-                    "model": responses_model(),
+                    "model": openai_responses_model(),
                     "input": "Reply with exactly PONG and nothing else."
                 }),
             ),
@@ -1854,7 +1792,7 @@ mod tests {
     #[ignore = "requires OPENAI_API_KEY and live OpenAI Responses API access"]
     async fn openai_responses_proxy_can_stream_text_response() {
         let (proxy_addr, shutdown_tx) = start_openai_proxy().await;
-        let timeout = responses_timeout();
+        let timeout = openai_responses_timeout();
 
         let response = tokio::time::timeout(
             timeout,
@@ -1862,7 +1800,7 @@ mod tests {
                 proxy_addr,
                 "/v1/responses",
                 json!({
-                    "model": responses_model(),
+                    "model": openai_responses_model(),
                     "input": "Reply with exactly PONG and nothing else.",
                     "stream": true
                 }),

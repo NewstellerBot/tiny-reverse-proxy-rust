@@ -30,6 +30,7 @@ impl FileProjectIndexStore {
         &self,
     ) -> Result<Vec<PersistedProjectIndex>, Box<dyn std::error::Error + Send + Sync>> {
         let mut entries = Vec::new();
+        let mut refreshed = Vec::new();
         for item in std::fs::read_dir(&self.root)? {
             let item = item?;
             if item.file_type()?.is_file()
@@ -37,10 +38,13 @@ impl FileProjectIndexStore {
             {
                 let bytes = std::fs::read(item.path())?;
                 let record: PersistedProjectIndex = serde_json::from_slice(&bytes)?;
-                self.cache
-                    .insert(record.policy.project_id.clone(), record.clone());
+                refreshed.push((record.policy.project_id.clone(), record.clone()));
                 entries.push(record);
             }
+        }
+        self.cache.clear();
+        for (project_id, entry) in refreshed {
+            self.cache.insert(project_id, entry);
         }
         Ok(entries)
     }
@@ -73,5 +77,52 @@ impl FileProjectIndexStore {
 
     fn path_for(&self, project_id: &str) -> PathBuf {
         self.root.join(format!("{project_id}.json"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use semantic_safety_protocol::{ProjectSemanticPolicy, SemanticEntity, SemanticTopic};
+    use tempfile::tempdir;
+
+    fn sample_index(project_id: &str, version: &str) -> PersistedProjectIndex {
+        PersistedProjectIndex {
+            policy: ProjectSemanticPolicy {
+                project_id: project_id.to_string(),
+                version: version.to_string(),
+                enabled: true,
+                entities: vec![SemanticEntity {
+                    entity_id: "entity-1".to_string(),
+                    name: "Entity 1".to_string(),
+                    aliases: vec!["entity1".to_string()],
+                }],
+                topics: vec![SemanticTopic {
+                    topic_id: "topic-1".to_string(),
+                    name: "Topic 1".to_string(),
+                    exemplars: vec!["example".to_string()],
+                    rerank_threshold: 0.5,
+                    require_entity_match: false,
+                }],
+                updated_at: "1".to_string(),
+            },
+            exemplar_embeddings: vec![vec![0.1, 0.2, 0.3]],
+            stored_exemplar_count: 1,
+        }
+    }
+
+    #[test]
+    fn load_all_refreshes_cache_after_deleted_files() {
+        let dir = tempdir().unwrap();
+        let store = FileProjectIndexStore::new(dir.path().to_path_buf()).unwrap();
+        let first = sample_index("project-a", "1");
+        store.upsert(first.clone()).unwrap();
+        assert_eq!(store.get("project-a").unwrap().policy.version, "1");
+
+        std::fs::remove_file(dir.path().join("project-a.json")).unwrap();
+
+        let loaded = store.load_all().unwrap();
+        assert!(loaded.is_empty());
+        assert!(store.get("project-a").is_none());
     }
 }

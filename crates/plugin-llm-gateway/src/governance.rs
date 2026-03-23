@@ -1488,12 +1488,10 @@ fn parse_string_array(value: Option<&serde_json::Value>) -> Option<Vec<String>> 
         return Some(Vec::new());
     };
     let array = value.as_array()?;
-    Some(
-        array
-            .iter()
-            .map(|entry| entry.as_str().map(ToString::to_string))
-            .collect::<Option<Vec<_>>>()?,
-    )
+    array
+        .iter()
+        .map(|entry| entry.as_str().map(ToString::to_string))
+        .collect::<Option<Vec<_>>>()
 }
 
 fn project_policy_json(record: &ProjectPolicyRecord) -> String {
@@ -1665,8 +1663,16 @@ fn project_prompt_json_with_active(record: &ProjectPromptRecord, active: bool) -
 }
 
 fn next_governance_change_id() -> String {
-    let sequence = GOVERNANCE_CHANGE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("chg-{}-{sequence:016x}", current_timestamp_string())
+    generate_unique_id("chg", &GOVERNANCE_CHANGE_COUNTER)
+}
+
+pub fn generate_unique_id(prefix: &str, counter: &AtomicU64) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = counter.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{nanos}-{sequence:016x}")
 }
 
 pub fn current_timestamp_string() -> String {

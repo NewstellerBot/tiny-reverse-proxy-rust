@@ -1,5 +1,4 @@
-/// SQL statements for creating tables on each backend.
-
+//! SQL statements for creating tables on each backend.
 #[cfg(feature = "store-sqlite")]
 pub const SQLITE_CREATE_TABLES: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS api_key_usage (

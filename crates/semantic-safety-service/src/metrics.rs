@@ -88,6 +88,12 @@ impl SemanticSafetyServiceMetrics {
     }
 }
 
+impl Default for SemanticSafetyServiceMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub async fn start_metrics_server(
     addr: SocketAddr,
     metrics: Arc<SemanticSafetyServiceMetrics>,

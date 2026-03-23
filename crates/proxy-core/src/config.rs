@@ -1616,18 +1616,13 @@ pub struct ModelAliasConfig {
 }
 
 /// Load-balancing strategy for a route.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum LbStrategy {
+    #[default]
     RoundRobin,
     LeastConnections,
     ConsistentHash,
     WeightedRoundRobin,
-}
-
-impl Default for LbStrategy {
-    fn default() -> Self {
-        LbStrategy::RoundRobin
-    }
 }
 
 /// A single route entry, supporting both simple arrays and extended table format.

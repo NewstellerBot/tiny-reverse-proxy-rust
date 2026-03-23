@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -15,7 +15,7 @@ use proxy_core::config::{
     ProviderSurfaceCatalog,
 };
 use semantic_safety_protocol::{ProjectSemanticPolicy, SemanticEntity, SemanticTopic};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
 use crate::api::LlmGatewayApi;
@@ -268,6 +268,50 @@ struct McpOauthCallbackPayload {
 }
 
 static PROMPT_ROLLOUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static ROUTING_RULE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Serialize)]
+struct FailedProviderResponse {
+    failed: Vec<FailedProviderResponseEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct FailedProviderResponseEntry {
+    name: String,
+    failed_ago_secs: u64,
+    cooldown_remaining_secs: u64,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderHealthResponse {
+    providers: Vec<ProviderHealthResponseEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderHealthResponseEntry {
+    name: String,
+    eligible: bool,
+    cooldown_remaining_secs: u64,
+    cooldown_reason: Option<String>,
+    active_requests: u32,
+    samples: u64,
+    ewma_latency_ms: f64,
+    ewma_error_rate: f64,
+    ewma_timeout_rate: f64,
+    ewma_rate_limit_rate: f64,
+    adaptive_penalties: ProviderPenaltyResponse,
+    adaptive_penalty_total: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderPenaltyResponse {
+    active_requests: f64,
+    latency: f64,
+    error: f64,
+    timeout: f64,
+    rate_limit: f64,
+}
 
 struct PreparedPromptRolloutDecision {
     policy: ProjectRolloutPolicyRecord,
@@ -496,12 +540,12 @@ pub async fn handle_request_with_auth(
             // Path-parameter routes.
             if let Some(hash_prefix) = path.strip_prefix("/api/v1/keys/") {
                 if !hash_prefix.is_empty() {
-                    match req.method() {
-                        &Method::GET => handle_get_key(&api, hash_prefix, auth_ctx.as_ref()),
-                        &Method::PATCH => {
+                    match *req.method() {
+                        Method::GET => handle_get_key(&api, hash_prefix, auth_ctx.as_ref()),
+                        Method::PATCH => {
                             handle_update_key(&api, hash_prefix, req, auth_ctx.as_ref()).await
                         }
-                        &Method::DELETE => {
+                        Method::DELETE => {
                             handle_delete_key(&api, hash_prefix, auth_ctx.as_ref()).await
                         }
                         _ => method_not_allowed(),
@@ -531,8 +575,8 @@ pub async fn handle_request_with_auth(
                 }
             } else if let Some(name) = path.strip_prefix("/api/v1/cost/models/") {
                 if !name.is_empty() {
-                    match req.method() {
-                        &Method::PUT => {
+                    match *req.method() {
+                        Method::PUT => {
                             if let Some(resp) = ensure_permission(
                                 &api,
                                 auth_ctx.as_ref(),
@@ -544,7 +588,7 @@ pub async fn handle_request_with_auth(
                                 handle_put_model_cost(&api, name, req).await
                             }
                         }
-                        &Method::DELETE => {
+                        Method::DELETE => {
                             if let Some(resp) = ensure_permission(
                                 &api,
                                 auth_ctx.as_ref(),
@@ -583,8 +627,8 @@ pub async fn handle_request_with_auth(
                 }
             } else if let Some(name) = path.strip_prefix("/api/v1/providers/") {
                 if !name.is_empty() {
-                    match req.method() {
-                        &Method::GET => {
+                    match *req.method() {
+                        Method::GET => {
                             if let Some(resp) = ensure_permission(
                                 &api,
                                 auth_ctx.as_ref(),
@@ -596,7 +640,7 @@ pub async fn handle_request_with_auth(
                                 handle_get_provider(&api, name)
                             }
                         }
-                        &Method::PUT => {
+                        Method::PUT => {
                             if let Some(resp) = ensure_permission(
                                 &api,
                                 auth_ctx.as_ref(),
@@ -608,7 +652,7 @@ pub async fn handle_request_with_auth(
                                 handle_put_provider(&api, name, req).await
                             }
                         }
-                        &Method::PATCH => {
+                        Method::PATCH => {
                             if let Some(resp) = ensure_permission(
                                 &api,
                                 auth_ctx.as_ref(),
@@ -620,7 +664,7 @@ pub async fn handle_request_with_auth(
                                 handle_patch_provider(&api, name, req).await
                             }
                         }
-                        &Method::DELETE => {
+                        Method::DELETE => {
                             if let Some(resp) = ensure_permission(
                                 &api,
                                 auth_ctx.as_ref(),
@@ -1690,21 +1734,18 @@ fn handle_failed_providers(api: &LlmGatewayApi) -> Response<Full<Bytes>> {
         }
     };
 
-    let entries: Vec<String> = failed
-        .iter()
-        .map(|status| {
-            format!(
-                r#"{{"name":"{}","failed_ago_secs":{},"cooldown_remaining_secs":{},"reason":"{}"}}"#,
-                status.name,
-                status.failed_ago_secs,
-                status.cooldown_remaining_secs,
-                status.reason,
-            )
-        })
-        .collect();
-
-    let body = format!(r#"{{"failed":[{}]}}"#, entries.join(","));
-    json_response(StatusCode::OK, body)
+    let body = FailedProviderResponse {
+        failed: failed
+            .into_iter()
+            .map(|status| FailedProviderResponseEntry {
+                name: status.name,
+                failed_ago_secs: status.failed_ago_secs,
+                cooldown_remaining_secs: status.cooldown_remaining_secs,
+                reason: status.reason,
+            })
+            .collect(),
+    };
+    json_response(StatusCode::OK, serde_json::to_string(&body).unwrap())
 }
 
 fn handle_provider_health(api: &LlmGatewayApi) -> Response<Full<Bytes>> {
@@ -1718,43 +1759,32 @@ fn handle_provider_health(api: &LlmGatewayApi) -> Response<Full<Bytes>> {
         }
     };
 
-    let entries: Vec<String> = health
-        .iter()
-        .map(|provider| {
-            format!(
-                concat!(
-                    r#"{{"name":"{}","eligible":{},"cooldown_remaining_secs":{},"cooldown_reason":{},"#,
-                    r#""active_requests":{},"samples":{},"ewma_latency_ms":{:.2},"ewma_error_rate":{:.4},"#,
-                    r#""ewma_timeout_rate":{:.4},"ewma_rate_limit_rate":{:.4},"adaptive_penalties":{{"#,
-                    r#""active_requests":{:.2},"latency":{:.2},"error":{:.2},"timeout":{:.2},"rate_limit":{:.2}}},"#,
-                    r#""adaptive_penalty_total":{:.2}}}"#
-                ),
-                provider.name,
-                provider.eligible,
-                provider.cooldown_remaining_secs,
-                provider
-                    .cooldown_reason
-                    .as_ref()
-                    .map(|reason| format!(r#""{}""#, reason))
-                    .unwrap_or_else(|| "null".to_string()),
-                provider.active_requests,
-                provider.samples,
-                provider.ewma_latency_ms,
-                provider.ewma_error_rate,
-                provider.ewma_timeout_rate,
-                provider.ewma_rate_limit_rate,
-                provider.adaptive_penalty_active_requests,
-                provider.adaptive_penalty_latency,
-                provider.adaptive_penalty_error,
-                provider.adaptive_penalty_timeout,
-                provider.adaptive_penalty_rate_limit,
-                provider.adaptive_penalty_total,
-            )
-        })
-        .collect();
-
-    let body = format!(r#"{{"providers":[{}]}}"#, entries.join(","));
-    json_response(StatusCode::OK, body)
+    let body = ProviderHealthResponse {
+        providers: health
+            .into_iter()
+            .map(|provider| ProviderHealthResponseEntry {
+                name: provider.name,
+                eligible: provider.eligible,
+                cooldown_remaining_secs: provider.cooldown_remaining_secs,
+                cooldown_reason: provider.cooldown_reason,
+                active_requests: provider.active_requests,
+                samples: provider.samples,
+                ewma_latency_ms: provider.ewma_latency_ms,
+                ewma_error_rate: provider.ewma_error_rate,
+                ewma_timeout_rate: provider.ewma_timeout_rate,
+                ewma_rate_limit_rate: provider.ewma_rate_limit_rate,
+                adaptive_penalties: ProviderPenaltyResponse {
+                    active_requests: provider.adaptive_penalty_active_requests,
+                    latency: provider.adaptive_penalty_latency,
+                    error: provider.adaptive_penalty_error,
+                    timeout: provider.adaptive_penalty_timeout,
+                    rate_limit: provider.adaptive_penalty_rate_limit,
+                },
+                adaptive_penalty_total: provider.adaptive_penalty_total,
+            })
+            .collect(),
+    };
+    json_response(StatusCode::OK, serde_json::to_string(&body).unwrap())
 }
 
 fn handle_tool_runtime_status(api: &LlmGatewayApi) -> Response<Full<Bytes>> {
@@ -4036,9 +4066,9 @@ async fn handle_session_takeover(
     }
 
     let lease_ttl_secs = payload.lease_ttl_secs.unwrap_or(60);
-    if record.owner_id.as_deref() != Some(owner_id.as_str()) {
-        record.owner_acquired_at_unix = Some(now);
-    } else if record.owner_acquired_at_unix.is_none() {
+    if record.owner_id.as_deref() != Some(owner_id.as_str())
+        || record.owner_acquired_at_unix.is_none()
+    {
         record.owner_acquired_at_unix = Some(now);
     }
     record.owner_id = Some(owner_id);
@@ -5471,7 +5501,7 @@ fn effective_runtime_policy_response(
         project_policy.and_then(|policy| policy.tool_approval_mode.as_deref()),
         project_policy.and_then(|policy| policy.allowed_tools.as_deref()),
     )
-    .unwrap_or_else(|_| {
+    .unwrap_or({
         (
             crate::virtual_keys::ToolApprovalMode::AllowAll,
             None,
@@ -5999,12 +6029,11 @@ fn validate_prompt_rollout_evaluation_context(
 }
 
 fn generate_prompt_rollout_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let sequence = PROMPT_ROLLOUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("rollout-{nanos}-{sequence}")
+    crate::governance::generate_unique_id("rollout", &PROMPT_ROLLOUT_SEQUENCE)
+}
+
+fn generate_routing_rule_id() -> String {
+    crate::governance::generate_unique_id("rr", &ROUTING_RULE_SEQUENCE)
 }
 
 async fn supersede_live_prompt_canaries(
@@ -6805,7 +6834,7 @@ async fn handle_project_subroutes(
             };
             let record = RoutingRuleRecord {
                 rule_id: extract_json_string(&body, "rule_id")
-                    .unwrap_or_else(|| format!("rr-{}", current_timestamp_string())),
+                    .unwrap_or_else(generate_routing_rule_id),
                 project_id: project_id.to_string(),
                 name: extract_json_string(&body, "name")
                     .unwrap_or_else(|| "routing rule".to_string()),

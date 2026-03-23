@@ -1,0 +1,38 @@
+name: Live OpenAI Responses Smoke
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  OPENAI_ORGANIZATION: ${{ secrets.OPENAI_ORGANIZATION }}
+  OPENAI_PROJECT: ${{ secrets.OPENAI_PROJECT }}
+
+jobs:
+  gateway-live-responses:
+    name: Gateway Live Responses Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release-live-openai
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify live smoke secrets
+        run: |
+          if [ -z "${OPENAI_API_KEY}" ]; then
+            echo "OPENAI_API_KEY must be configured for the release-live-openai environment." >&2
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p tiny-reverse-proxy --features plugin-llm-gateway --test live_gateway_responses gateway_virtual_key_responses_proxy_can_generate_text_response -- --ignored --nocapture
+      - run: cargo test --locked -p tiny-reverse-proxy --features plugin-llm-gateway --test live_gateway_responses gateway_virtual_key_responses_proxy_can_stream_text_response -- --ignored --nocapture

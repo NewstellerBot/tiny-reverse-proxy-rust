@@ -193,10 +193,10 @@ impl QwenTokenizer {
                 return Err("token row exceeded max length after truncation".into());
             }
             let pad_len = max_length - row.len();
-            input_ids.extend(std::iter::repeat(self.pad_id as i32).take(pad_len));
-            attention_mask.extend(std::iter::repeat(0).take(pad_len));
+            input_ids.extend(std::iter::repeat_n(self.pad_id as i32, pad_len));
+            attention_mask.extend(std::iter::repeat_n(0, pad_len));
             input_ids.extend(row.iter().map(|token| *token as i32));
-            attention_mask.extend(std::iter::repeat(1).take(row.len()));
+            attention_mask.extend(std::iter::repeat_n(1, row.len()));
         }
         Ok(EncodedBatch {
             input_ids,
@@ -528,7 +528,7 @@ mod tests {
             .build()
             .unwrap();
         let mut tokenizer = Tokenizer::new(model);
-        tokenizer.with_pre_tokenizer(Some(Whitespace::default()));
+        tokenizer.with_pre_tokenizer(Some(Whitespace));
         QwenTokenizer::from_parts(tokenizer, 1)
     }
 

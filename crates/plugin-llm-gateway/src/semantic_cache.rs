@@ -212,7 +212,7 @@ impl SemanticCache {
         if let Some(metrics) = self.metrics.as_ref() {
             metrics
                 .semantic_cache_entries
-                .set(entry_count.try_into().unwrap_or(i64::MAX) as i64);
+                .set(entry_count.try_into().unwrap_or(i64::MAX));
         }
         if let Some(store) = self.store.as_ref() {
             if let Err(err) = store.upsert_semantic_cache_entry(&store_record).await {
@@ -507,7 +507,7 @@ impl Plugin for SemanticCache {
             self.record_skip(&virtual_key.provider_name, "missing_model");
             return Action::Continue;
         };
-        let Some(normalized_prompt) = extract_request_prompt(&request_json) else {
+        let Some(normalized_prompt) = extract_request_prompt(request_json) else {
             update_request_body(ctx, body);
             self.record_skip(&virtual_key.provider_name, "unsupported_shape");
             return Action::Continue;

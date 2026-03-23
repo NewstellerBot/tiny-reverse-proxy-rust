@@ -584,7 +584,7 @@ impl<R: RouteResolver> ProxyService<R> {
 
         // Buffer body when plugins need it or when Content-Length is missing
         // (chunked/streaming uploads) so the size limit is enforced.
-        let has_plugins = self.plugins.as_ref().map_or(false, |p| !p.is_empty());
+        let has_plugins = self.plugins.as_ref().is_some_and(|p| !p.is_empty());
         let should_buffer_for_limit = !req.headers().contains_key(CONTENT_LENGTH);
         let should_buffer_body = has_plugins || should_buffer_for_limit;
         let (req, plugin_body) = if should_buffer_body {
@@ -723,7 +723,7 @@ impl<R: RouteResolver> ProxyService<R> {
             .remove::<crate::plugin::ProviderCandidates>();
         let use_provider_candidates = provider_candidates
             .as_ref()
-            .map_or(false, |pc| !pc.0.is_empty());
+            .is_some_and(|pc| !pc.0.is_empty());
 
         let selected_upstream = plugin_ctx.selected_upstream.clone();
         let selected_servers: Vec<String> = match selected_upstream {
@@ -2149,7 +2149,7 @@ mod tests {
     #[tokio::test]
     async fn cache_hit_survives_unhealthy_origin() {
         let upstream = start_upstream("cached body").await;
-        let health_state = HealthState::new(&[upstream.clone()]);
+        let health_state = HealthState::new(std::slice::from_ref(&upstream));
         let cache = ResponseCache::new(1, 300);
         let router = Arc::new(CatchAllRouter {
             route_config: RouteConfig {

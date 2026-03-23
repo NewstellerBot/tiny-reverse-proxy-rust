@@ -93,6 +93,12 @@ impl Metrics {
     }
 }
 
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Start a metrics HTTP server on the given port.
 /// This runs a simple TCP listener serving the /metrics endpoint.
 pub async fn start_metrics_server(port: u16, metrics: Metrics) {
