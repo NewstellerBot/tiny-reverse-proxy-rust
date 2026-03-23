@@ -72,7 +72,7 @@ async fn cost_tracker_records_prometheus_metrics() {
 
     // Verify Prometheus metrics were recorded
     let families = registry.gather();
-    let names: Vec<&str> = families.iter().map(|f| f.get_name()).collect();
+    let names: Vec<&str> = families.iter().map(|f| f.name()).collect();
 
     assert!(
         names.contains(&"llm_tokens_total"),
@@ -374,7 +374,7 @@ fn shared_registry_contains_both_core_and_llm_metrics() {
         .inc();
 
     let families = registry.gather();
-    let names: Vec<&str> = families.iter().map(|f| f.get_name()).collect();
+    let names: Vec<&str> = families.iter().map(|f| f.name()).collect();
 
     // Both core and LLM metrics should be present on the same registry
     assert!(

@@ -1,7 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::future::poll_fn;
-use std::io::BufReader;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,6 +10,7 @@ use h3_quinn::{quinn, OpenStreams};
 use hyper::http::{Method, Request, Uri};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls_pki_types::pem::PemObject;
 
 #[derive(Debug, Clone)]
 struct Args {
@@ -128,9 +127,8 @@ fn parse_target(uri: &Uri) -> Result<SocketAddr, Box<dyn std::error::Error>> {
 }
 
 fn load_roots_from_pem(path: &str) -> Result<rustls::RootCertStore, Box<dyn std::error::Error>> {
-    let cert_file = File::open(path)?;
     let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_pemfile::certs(&mut BufReader::new(cert_file)) {
+    for cert in CertificateDer::pem_file_iter(path)? {
         roots.add(cert?)?;
     }
     Ok(roots)

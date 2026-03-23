@@ -9,4 +9,4 @@ native-tensorrt = ["semantic-safety-trt-sys/native-tensorrt"]
 
 [dependencies]
 semantic-safety-trt-sys = { path = "../semantic-safety-trt-sys" }
-tokenizers = "0.20"
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }

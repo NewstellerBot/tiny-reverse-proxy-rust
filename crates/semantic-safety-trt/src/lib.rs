@@ -464,15 +464,13 @@ pub use native::{NativeEmbeddingEngine, NativeRerankerEngine};
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::pre_tokenizers::whitespace::Whitespace;
 
     use super::*;
 
     fn test_tokenizer() -> QwenTokenizer {
-        let vocab = HashMap::from([
+        let vocab = [
             ("[UNK]".to_string(), 0u32),
             ("<|endoftext|>".to_string(), 1u32),
             ("Instruct".to_string(), 2u32),
@@ -521,7 +519,9 @@ mod tests {
             ("system".to_string(), 45u32),
             ("user".to_string(), 46u32),
             ("assistant".to_string(), 47u32),
-        ]);
+        ]
+        .into_iter()
+        .collect();
         let model = WordLevel::builder()
             .vocab(vocab)
             .unk_token("[UNK]".into())

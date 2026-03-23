@@ -439,7 +439,7 @@ mod tests {
             .observe(12.0);
 
         let families = registry.gather();
-        let names: Vec<&str> = families.iter().map(|f| f.get_name()).collect();
+        let names: Vec<&str> = families.iter().map(|f| f.name()).collect();
 
         assert!(names.contains(&"llm_tokens_total"));
         assert!(names.contains(&"llm_cost_dollars_total"));

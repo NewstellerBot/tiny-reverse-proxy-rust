@@ -597,30 +597,10 @@ async fn start_server(config_file: &str) -> std::io::Result<()> {
         match (&config.tls_cert, &config.tls_key) {
             (Some(cert_path), Some(key_path)) => {
                 // Load certs from PEM files for both TLS and QUIC.
-                use std::io::BufReader;
-                let cert_file = std::fs::File::open(cert_path).unwrap_or_else(|e| {
-                    tracing::error!("Failed to open TLS cert file: {}", e);
+                let (certs, key) = tls::load_tls_material(cert_path, key_path).unwrap_or_else(|e| {
+                    tracing::error!("Failed to load TLS material: {}", e);
                     exit(1);
                 });
-                let key_file = std::fs::File::open(key_path).unwrap_or_else(|e| {
-                    tracing::error!("Failed to open TLS key file: {}", e);
-                    exit(1);
-                });
-                let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap_or_else(|e| {
-                        tracing::error!("Failed to parse TLS certs: {}", e);
-                        exit(1);
-                    });
-                let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-                    .unwrap_or_else(|e| {
-                        tracing::error!("Failed to parse TLS key: {}", e);
-                        exit(1);
-                    })
-                    .unwrap_or_else(|| {
-                        tracing::error!("No private key found in key file");
-                        exit(1);
-                    });
 
                 let quic_certs = certs.clone();
                 let quic_key = key.clone_key();

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use rustls_pki_types::pem::{Error as PemError, PemObject};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio_rustls::TlsAcceptor;
 
@@ -55,20 +56,25 @@ pub fn cert_fingerprint(cert: &CertificateDer) -> String {
 /// Reads the certificate chain and private key from the given file paths,
 /// configures ALPN protocols for h2 and http/1.1, and returns a
 /// [`TlsAcceptor`] ready for use.
+pub fn load_tls_material(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Box<dyn std::error::Error>> {
+    let certs = CertificateDer::pem_file_iter(cert_path)?.collect::<Result<Vec<_>, _>>()?;
+    let key = match PrivateKeyDer::from_pem_file(key_path) {
+        Ok(key) => key,
+        Err(PemError::NoItemsFound) => return Err("no private key found in key file".into()),
+        Err(error) => return Err(error.into()),
+    };
+
+    Ok((certs, key))
+}
+
 pub fn load_tls_acceptor(
     cert_path: &str,
     key_path: &str,
 ) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
-    use std::io::BufReader;
-
-    let cert_file = std::fs::File::open(cert_path)?;
-    let key_file = std::fs::File::open(key_path)?;
-
-    let certs: Vec<_> =
-        rustls_pemfile::certs(&mut BufReader::new(cert_file)).collect::<Result<Vec<_>, _>>()?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))?
-        .ok_or("no private key found in key file")?;
-
+    let (certs, key) = load_tls_material(cert_path, key_path)?;
     build_tls_acceptor(certs, key)
 }
 
@@ -237,6 +243,24 @@ mod tests {
         let (certs, key) = generate_self_signed_cert(&["localhost"]).unwrap();
         let acceptor = build_tls_acceptor(certs, key);
         assert!(acceptor.is_ok());
+    }
+
+    #[test]
+    fn test_load_tls_material_from_persisted_pem() {
+        let (certs, key) = generate_self_signed_cert(&["localhost"]).unwrap();
+        let key_pem = private_key_to_pem(&key);
+        let dir = tempfile::tempdir().unwrap();
+        persist_certs(dir.path(), &certs, &key_pem).unwrap();
+
+        let loaded = load_tls_material(
+            dir.path().join("cert.pem").to_str().unwrap(),
+            dir.path().join("key.pem").to_str().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(loaded.0.len(), 1);
+        assert!(!loaded.0[0].as_ref().is_empty());
+        assert!(!loaded.1.secret_der().is_empty());
     }
 
     #[test]
