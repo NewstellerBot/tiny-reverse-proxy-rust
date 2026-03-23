@@ -1652,15 +1652,15 @@ fn record_prompt_cache_observation(
     if let Some(metrics) = metrics {
         metrics
             .prompt_cache_requests_total
-            .with_label_values(&[&usage.provider_name, &usage.outcome])
+            .with_label_values(&[usage.provider_name.as_str(), usage.outcome.as_str()])
             .inc();
         metrics
             .prompt_cache_read_tokens_total
-            .with_label_values(&[&usage.provider_name])
+            .with_label_values(&[usage.provider_name.as_str()])
             .inc_by(usage.read_tokens);
         metrics
             .prompt_cache_write_tokens_total
-            .with_label_values(&[&usage.provider_name])
+            .with_label_values(&[usage.provider_name.as_str()])
             .inc_by(usage.write_tokens);
     }
     record_prompt_cache_otel(otel, usage);

@@ -1,0 +1,5 @@
+[advisories]
+# `sqlx-mysql` currently pulls `rsa` 0.9.x for MySQL authentication and
+# RustSec does not publish a fixed upgrade yet. Keep this narrow exception
+# until upstream ships a patched dependency chain.
+ignore = ["RUSTSEC-2023-0071"]

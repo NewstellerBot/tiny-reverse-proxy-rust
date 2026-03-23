@@ -529,11 +529,11 @@ impl Plugin for SemanticCache {
             if let Some(metrics) = self.metrics.as_ref() {
                 metrics
                     .semantic_cache_requests_total
-                    .with_label_values(&[&virtual_key.provider_name, "hit"])
+                    .with_label_values(&[virtual_key.provider_name.as_str(), "hit"])
                     .inc();
                 metrics
                     .semantic_cache_saved_prompt_tokens_total
-                    .with_label_values(&[&virtual_key.provider_name])
+                    .with_label_values(&[virtual_key.provider_name.as_str()])
                     .inc_by(entry.prompt_tokens);
             }
             let mut response = cached_response(&entry, similarity);
@@ -549,7 +549,7 @@ impl Plugin for SemanticCache {
         if let Some(metrics) = self.metrics.as_ref() {
             metrics
                 .semantic_cache_requests_total
-                .with_label_values(&[&virtual_key.provider_name, "miss"])
+                .with_label_values(&[virtual_key.provider_name.as_str(), "miss"])
                 .inc();
         }
         ctx.extensions.insert(SemanticCacheRequestMeta {
@@ -626,7 +626,7 @@ impl Plugin for SemanticCache {
         if let Some(metrics) = self.metrics.as_ref() {
             metrics
                 .semantic_cache_requests_total
-                .with_label_values(&[&request_meta.provider_name, "store"])
+                .with_label_values(&[request_meta.provider_name.as_str(), "store"])
                 .inc();
         }
         parts.headers.remove(CONTENT_LENGTH);

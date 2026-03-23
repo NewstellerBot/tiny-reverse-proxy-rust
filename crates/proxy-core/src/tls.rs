@@ -11,7 +11,7 @@ pub fn generate_self_signed_cert(
     hostnames: &[&str],
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Box<dyn std::error::Error>> {
     let san_names: Vec<String> = hostnames.iter().map(|h| h.to_string()).collect();
-    let mut params = rcgen::CertificateParams::new(san_names);
+    let mut params = rcgen::CertificateParams::new(san_names)?;
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, hostnames[0].to_string());
@@ -21,12 +21,13 @@ pub fn generate_self_signed_cert(
     // Mark as CA so browsers trust it when added to the system root store.
     params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
 
-    let cert = rcgen::Certificate::from_params(params)?;
+    let signing_key = rcgen::KeyPair::generate()?;
+    let cert = params.self_signed(&signing_key)?;
 
-    let cert_der = cert.serialize_der()?;
-    let key_der = cert.serialize_private_key_der();
+    let cert_der = cert.der().clone();
+    let key_der = signing_key.serialize_der();
 
-    let certs = vec![CertificateDer::from(cert_der)];
+    let certs = vec![cert_der];
     let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(key_der));
 
     Ok((certs, key))

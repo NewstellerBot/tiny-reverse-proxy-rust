@@ -1306,13 +1306,13 @@ impl Plugin for CostTracker {
                 let masked = mask_key(&meta.api_key);
                 let model_label = meta.model.as_deref().unwrap_or("unknown");
                 m.tokens_total
-                    .with_label_values(&[&masked, model_label, "input"])
+                    .with_label_values(&[masked.as_str(), model_label, "input"])
                     .inc_by(input_tokens);
                 m.tokens_total
-                    .with_label_values(&[&masked, model_label, "output"])
+                    .with_label_values(&[masked.as_str(), model_label, "output"])
                     .inc_by(output_tokens);
                 m.cost_dollars_total
-                    .with_label_values(&[&masked, model_label])
+                    .with_label_values(&[masked.as_str(), model_label])
                     .inc_by(request_cost);
                 m.request_tokens
                     .with_label_values(&["input"])
@@ -1548,13 +1548,13 @@ impl Plugin for CostTracker {
                 let masked = mask_key(&meta.api_key);
                 let model_label = meta.model.as_deref().unwrap_or("unknown");
                 m.tokens_total
-                    .with_label_values(&[&masked, model_label, "input"])
+                    .with_label_values(&[masked.as_str(), model_label, "input"])
                     .inc_by(input_tokens);
                 m.tokens_total
-                    .with_label_values(&[&masked, model_label, "output"])
+                    .with_label_values(&[masked.as_str(), model_label, "output"])
                     .inc_by(output_tokens);
                 m.cost_dollars_total
-                    .with_label_values(&[&masked, model_label])
+                    .with_label_values(&[masked.as_str(), model_label])
                     .inc_by(request_cost);
                 m.request_tokens
                     .with_label_values(&["input"])

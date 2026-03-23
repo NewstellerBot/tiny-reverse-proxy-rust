@@ -33,9 +33,10 @@ mod tests {
 
     /// Generate a self-signed certificate for testing using rcgen.
     fn generate_test_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let cert_der = CertificateDer::from(cert.serialize_der().unwrap());
-        let key_der = PrivateKeyDer::Pkcs8(cert.serialize_private_key_der().into());
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(signing_key.serialize_der().into());
         (cert_der, key_der)
     }
 
