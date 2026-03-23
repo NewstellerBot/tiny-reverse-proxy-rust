@@ -1,0 +1,3 @@
+[submodule "web/ui-kit"]
+	path = web/ui-kit
+	url = https://github.com/Blimp-Labs/ui-kit.git

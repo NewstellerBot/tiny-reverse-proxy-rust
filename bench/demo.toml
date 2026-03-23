@@ -1,0 +1,21 @@
+port = 8443
+tls = true
+metrics_port = 9090
+compression = true
+max_request_body_bytes = 5242880
+
+[rate_limit]
+requests_per_second = 100.0
+burst = 50
+
+[circuit_breaker]
+failure_threshold = 5
+cooldown_secs = 30
+window_secs = 60
+
+[cache]
+max_size_mb = 10
+default_ttl_secs = 60
+
+[paths]
+"/*" = ["127.0.0.1:9000"]

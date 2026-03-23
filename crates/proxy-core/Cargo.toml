@@ -1,0 +1,68 @@
+[package]
+name = "proxy-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+proxy-auth = { path = "../proxy-auth" }
+async-trait = "0.1"
+glob = "0.3.1"
+toml = "0.5"
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio", "server-auto"] }
+http-body-util = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+socket2 = "0.5"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-pemfile = "2"
+
+# Auto-TLS (self-signed cert generation)
+rcgen = "0.11"
+sha2 = "0.10"
+
+# HTTPS upstreams
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "tls12"] }
+webpki-roots = "0.26"
+
+# Hot config reload
+arc-swap = "1"
+
+# Prometheus metrics
+prometheus = "0.13"
+
+# Rate limiting
+dashmap = "5"
+
+# Response compression
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "zstd"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+# Smarter load balancing (consistent hashing)
+siphasher = "1"
+
+# HTTP/3 (QUIC)
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+quinn = { version = "0.11", default-features = false, features = ["ring", "runtime-tokio", "rustls"] }
+
+# HTTP response cache
+lru = "0.12"
+
+# OpenTelemetry (optional)
+opentelemetry = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.27", optional = true }
+tracing-opentelemetry = { version = "0.28", optional = true }
+
+[features]
+opentelemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+
+[dev-dependencies]
+trp-test-support = { path = "../trp-test-support" }
+tempfile = "3.2"
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }

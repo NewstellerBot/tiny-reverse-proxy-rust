@@ -1,0 +1,131 @@
+syntax = "proto3";
+
+package semantic_safety.v1;
+
+message SemanticEntity {
+  string entity_id = 1;
+  string name = 2;
+  repeated string aliases = 3;
+}
+
+message SemanticTopic {
+  string topic_id = 1;
+  string name = 2;
+  repeated string exemplars = 3;
+  float rerank_threshold = 4;
+  bool require_entity_match = 5;
+}
+
+message ProjectSemanticPolicy {
+  string project_id = 1;
+  string version = 2;
+  bool enabled = 3;
+  repeated SemanticEntity entities = 4;
+  repeated SemanticTopic topics = 5;
+  string updated_at = 6;
+}
+
+message Chunk {
+  string path = 1;
+  string text = 2;
+}
+
+message Finding {
+  string chunk_path = 1;
+  string entity_id = 2;
+  string entity_text = 3;
+  string topic_id = 4;
+  string matched_exemplar = 5;
+  float embedding_score = 6;
+  float rerank_score = 7;
+}
+
+enum IndexState {
+  INDEX_STATE_UNSPECIFIED = 0;
+  INDEX_STATE_READY = 1;
+  INDEX_STATE_MISSING = 2;
+  INDEX_STATE_STALE = 3;
+  INDEX_STATE_DISABLED = 4;
+  INDEX_STATE_DEGRADED = 5;
+}
+
+message EvaluateRequest {
+  string project_id = 1;
+  string policy_version = 2;
+  string request_id = 3;
+  string path = 4;
+  string model = 5;
+  bool streaming = 6;
+  repeated Chunk chunks = 7;
+  uint32 top_k = 8;
+}
+
+message EvaluateResponse {
+  string project_id = 1;
+  string policy_version = 2;
+  repeated Finding findings = 3;
+  uint64 service_latency_ms = 4;
+  IndexState index_state = 5;
+  string degraded_reason = 6;
+}
+
+message UpsertProjectPolicyRequest {
+  ProjectSemanticPolicy policy = 1;
+}
+
+message UpsertProjectPolicyResponse {
+  bool ok = 1;
+  string project_id = 2;
+  string policy_version = 3;
+}
+
+message DeleteProjectPolicyRequest {
+  string project_id = 1;
+}
+
+message DeleteProjectPolicyResponse {
+  bool ok = 1;
+}
+
+message GetProjectSyncStatusRequest {
+  string project_id = 1;
+}
+
+message GetProjectSyncStatusResponse {
+  string project_id = 1;
+  string policy_version = 2;
+  IndexState index_state = 3;
+  string updated_at = 4;
+  uint64 stored_exemplar_count = 5;
+}
+
+message ProjectSyncState {
+  string project_id = 1;
+  string policy_version = 2;
+  IndexState index_state = 3;
+  string updated_at = 4;
+  uint64 stored_exemplar_count = 5;
+}
+
+message ListProjectSyncStatesRequest {}
+
+message ListProjectSyncStatesResponse {
+  repeated ProjectSyncState projects = 1;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool ready = 1;
+  string backend = 2;
+  string message = 3;
+}
+
+service SemanticSafetyService {
+  rpc Evaluate(EvaluateRequest) returns (EvaluateResponse);
+  rpc UpsertProjectPolicy(UpsertProjectPolicyRequest) returns (UpsertProjectPolicyResponse);
+  rpc DeleteProjectPolicy(DeleteProjectPolicyRequest) returns (DeleteProjectPolicyResponse);
+  rpc GetProjectSyncStatus(GetProjectSyncStatusRequest) returns (GetProjectSyncStatusResponse);
+  rpc ListProjectSyncStates(ListProjectSyncStatesRequest) returns (ListProjectSyncStatesResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}

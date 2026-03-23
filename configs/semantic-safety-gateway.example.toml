@@ -1,0 +1,12 @@
+[[plugins]]
+name = "semantic_safety"
+enabled = true
+
+[plugins.config]
+endpoint = "http://127.0.0.1:50061"
+auth_token = "replace-me"
+timeout_ms = 750
+max_chunks = 16
+max_chars_per_chunk = 1024
+top_k = 8
+reconcile_interval_secs = 300

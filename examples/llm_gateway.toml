@@ -1,0 +1,33 @@
+port = 8888
+
+# Route OpenAI and Anthropic traffic to their respective APIs.
+[paths]
+"/v1/*" = ["https://api.openai.com"]
+"/anthropic/*" = ["https://api.anthropic.com"]
+
+# --- Rate Limiter ---
+# Per-API-key rate limiting (tokens-per-minute and requests-per-minute).
+[[plugins]]
+name = "rate_limiter"
+enabled = true
+[plugins.config]
+tokens_per_minute = 100000   # ~100k tokens/min per key
+burst_tokens = 20000         # allow short bursts up to 20k tokens
+
+# --- Cost Tracker ---
+# Per-API-key cost accumulation. Set budget_limit > 0 to enforce.
+# Generate per-model pricing with: python3 scripts/sync_model_prices.py
+[[plugins]]
+name = "cost_tracker"
+enabled = true
+[plugins.config]
+budget_limit = 0.02          # $0.02 cap per API key (0 = track only, no enforcement)
+log_interval_secs = 60       # log per-key usage every 60s
+default_cost_per_1k_input = 0.01   # fallback for unknown models
+default_cost_per_1k_output = 0.03
+
+# Per-model pricing ($ per 1k tokens).
+# Sync from OpenRouter: python3 scripts/sync_model_prices.py --providers openai anthropic
+[plugins.config.model_costs]
+# Example: a custom fine-tune
+# my-ft-gpt4o = { input = 0.0035, output = 0.014 }

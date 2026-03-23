@@ -1,0 +1,49 @@
+[package]
+name = "plugin-llm-gateway"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+proxy-core = { path = "../proxy-core" }
+proxy-auth = { path = "../proxy-auth" }
+semantic-safety-protocol = { path = "../semantic-safety-protocol" }
+async-trait = "0.1"
+async-recursion = "1"
+base64 = "0.22"
+bytes = "1"
+dashmap = "5"
+hex = "0.4"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "http2", "client", "server"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["ring", "http1", "http2", "tls12", "logging"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rand = "0.8"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "tls12"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio"], optional = true }
+prometheus = "0.13"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time", "process", "io-util"] }
+toml = "0.5"
+tonic = { version = "0.12", features = ["transport"] }
+tracing = "0.1"
+webpki-roots = "0.26"
+
+[features]
+default = ["store-sqlite"]
+store-sqlite = ["sqlx/sqlite"]
+store-postgres = ["sqlx/postgres"]
+store-mysql = ["sqlx/mysql"]
+opentelemetry = ["proxy-core/opentelemetry"]
+
+[dev-dependencies]
+trp-test-support = { path = "../trp-test-support" }
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+semantic-safety-service = { path = "../semantic-safety-service", features = ["dev_stub_backend"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tempfile = "3.2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }

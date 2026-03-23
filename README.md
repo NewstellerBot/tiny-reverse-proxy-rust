@@ -1,82 +1,144 @@
-# Tiny Reverse Proxy in Rust
+# Tiny Proxy
 
-![ferris the crab](assets/ferris.png)
+![banner](web/ui-kit/img/banner.png)
 
-For this assignment, I've implemented a tiny reverse proxy (trp) in rust. The implementation is minimal and implements only the basic functionality of reverse proxy—forwarding the requests to a desired service.
+A high-performance reverse proxy built in Rust with HTTP/3 support, an LLM gateway plugin, and a built-in web dashboard.
 
-## Project Structure
+## Architecture
 
-Everything related to the core implementation of the service is located in `src`, and things related to tests are in `tests` folder. 
+The project is a Cargo workspace with three crates:
 
-### `src`
+| Crate | Type | Purpose |
+|---|---|---|
+| `proxy-core` | lib | Core proxy library — config, routing, handlers, plugin API, rate limiting, caching, compression, TLS, HTTP/3, metrics, circuit breaker, health checks |
+| `plugin-llm-gateway` | lib | LLM gateway plugin — cost tracking, provider failover, rate limiting, virtual keys, streaming support |
+| `tiny-reverse-proxy` | bin | Binary entrypoint |
 
-Within `src` we have a couple main modules pertaining to the project. 
+## Features
 
-#### `router`
+- HTTP/1.1, HTTP/2, and HTTP/3 (QUIC) support
+- TLS termination
+- Glob-based route matching
+- Plugin system with pre/post request hooks
+- Rate limiting and circuit breaker
+- Response caching and compression
+- PROXY protocol support
+- Built-in web dashboard with live metrics
+- LLM gateway plugin with per-key cost tracking, budgets, and provider failover
 
-This is responsible for creating a routing table for the paths stored in the config file. It uses `glob` to match patterns so that we can define catch-all paths.
+## Docs
 
-#### `thread_pool`
+- [Management API](/Users/krystian/code/tiny-reverse-proxy-rust/docs/management-api.md)
+- [Deployment Guide](/Users/krystian/code/tiny-reverse-proxy-rust/docs/deployment.md)
+- [Semantic Safety V0](/Users/krystian/code/tiny-reverse-proxy-rust/docs/semantic-safety-v0.md)
 
-This is a very simple implementation of a thread pool. It's platform agnostic, whcih allows for easier migrations; however, it's not as efficient as event loops. In the future, we could integrate `tokio` into the project to keep it platform agnostic, yet implement the event loop.
+## Getting Started
 
-#### `utils` 
+### Prerequisites
 
-This file holds utility functions.
-
-#### `handlers` 
-
-This folder holds things related to handling the request on the server side. Anything from making a request to the upstream server to rewriting the request user is making happens here.
-
-### `tests`
-
-This folder holds all the tests for the project. 
-
-#### `units` 
-
-This folder holds unit tests.
-
-#### `stress` 
-
-This folder holds files related to stress testing. Those tests are quite simple and implemented for ease of use in python, which might also be their biggest drawback as they share resources.
-
-## Running the project
-
-### rust
-
-First, you need to install [rust](https://www.rust-lang.org/tools/install). Once rust is installed you can go ahead and use `cargo` to install all dependecies.
-
-### Installation
+Install [Rust](https://www.rust-lang.org/tools/install), or use the Nix dev shell:
 
 ```sh
-cd tiny-reverse-proxy-rust
-cargo install --path
-# For building a release version
-cargo build -r
+nix develop  # or direnv allow
 ```
 
-### Test Coverage
-
-For test coverage, I used `tarpaulin`. To get access to the report, you can install it through cargo and create an html version of the report.
+### Build & Run
 
 ```sh
-cargo install cargo-tarpaulin
-cargo tarpaulin --out Html
+cargo build --release
+./target/release/tiny-reverse-proxy --config config.toml
 ```
 
-### Stress Testing 
+To enable the LLM gateway plugin:
 
-I have used the python script in `test/stress` to stress test the server. I haven't managed to fully take it down. The requests have never failed; however, the time needed to server one on average has incrased quite dramatically after 4k requests.
+```sh
+cargo build --release --features plugin-llm-gateway
+```
 
-![](assets/performance.png)
+### Tests
 
-Using the unit tests, we have managed to cover 98% of the codebase.
+```sh
+cargo test --workspace
+```
 
-## Video Tutorial
+### Live OpenAI Realtime Smoke Tests
 
-[Loom Link](https://www.loom.com/share/eadc020be9994e5094bcfc5bf0706369?sid=e308bf2b-b88c-4cb3-9e46-add122082c65)
+These tests are ignored by default because they make live network calls to the
+OpenAI Realtime WebSocket API and require credentials.
 
-## AI Policy
+```sh
+OPENAI_API_KEY=... \
+cargo test -p tiny-reverse-proxy openai_realtime_proxy_connects_and_receives_session_created -- --ignored --nocapture
 
-I have used chatGPT for debugging code and finding language specific syntax. I have used copilot sporadically for autocompletion.
+OPENAI_API_KEY=... \
+cargo test -p tiny-reverse-proxy openai_realtime_proxy_can_generate_text_response -- --ignored --nocapture
+```
 
+Optional environment variables:
+
+- `OPENAI_REALTIME_MODEL` to override the default model (`gpt-realtime`)
+- `OPENAI_REALTIME_TIMEOUT_SECS` to increase the per-event wait timeout
+- `OPENAI_ORGANIZATION` / `OPENAI_ORG_ID`
+- `OPENAI_PROJECT` / `OPENAI_PROJECT_ID`
+
+### Live OpenAI Responses Smoke Tests
+
+These tests are ignored by default because they make live network calls to the
+OpenAI Responses API through the local proxy. They will read `OPENAI_API_KEY`
+from the environment or the repo-root `.env`.
+
+```sh
+cargo test -p tiny-reverse-proxy openai_responses_proxy_can_generate_text_response -- --ignored --nocapture
+
+cargo test -p tiny-reverse-proxy openai_responses_proxy_can_stream_text_response -- --ignored --nocapture
+```
+
+Optional environment variables:
+
+- `OPENAI_RESPONSES_MODEL` to override the default model (`gpt-4.1-mini`)
+- `OPENAI_RESPONSES_TIMEOUT_SECS` to increase the request/body timeout
+- `OPENAI_ORGANIZATION` / `OPENAI_ORG_ID`
+- `OPENAI_PROJECT` / `OPENAI_PROJECT_ID`
+
+### Live Gateway Responses Smoke Tests
+
+These tests are ignored by default and require the `plugin-llm-gateway`
+feature. They mint a real virtual key, send `/v1/responses` through the gateway
+plugin chain, and verify the live OpenAI response comes back through that
+managed path.
+
+```sh
+cargo test -p tiny-reverse-proxy --features plugin-llm-gateway gateway_virtual_key_responses_proxy_can_generate_text_response -- --ignored --nocapture
+
+cargo test -p tiny-reverse-proxy --features plugin-llm-gateway gateway_virtual_key_responses_proxy_can_stream_text_response -- --ignored --nocapture
+```
+
+### Python Realtime Smoke Test
+
+For a standalone smoke test outside Rust's test harness:
+
+```sh
+export OPENAI_API_KEY=...
+uv run --with websockets python3 scripts/openai_realtime_smoke.py --start-proxy --scenario smoke
+```
+
+For a heavier proxy-driven workload test:
+
+```sh
+export OPENAI_API_KEY=...
+uv run --with websockets python3 scripts/openai_realtime_smoke.py --start-proxy --scenario workload
+```
+
+To test OpenAI directly instead of a local proxy:
+
+```sh
+export OPENAI_API_KEY=...
+uv run --with websockets python3 scripts/openai_realtime_smoke.py --url wss://api.openai.com/v1/realtime --scenario smoke
+```
+
+### Stress Testing
+
+```sh
+python3 tests/stress/http3_large_body_spike.py
+python3 tests/stress/proxy_protocol_slow_header_soak.py
+```

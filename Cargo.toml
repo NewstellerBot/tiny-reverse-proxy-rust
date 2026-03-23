@@ -1,14 +1,18 @@
-[package]
-name = "tiny-reverse-proxy-rust"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+members = [
+    "crates/semantic-safety-protocol",
+    "crates/semantic-safety-trt-sys",
+    "crates/semantic-safety-trt",
+    "crates/semantic-safety-service",
+    "crates/proxy-auth",
+    "crates/proxy-core",
+    "crates/plugin-llm-gateway",
+    "crates/trp-test-support",
+    "crates/tiny-reverse-proxy",
+]
+resolver = "2"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependencies]
-glob = "0.3.1"
-socket2 = "0.5.8"
-toml = "0.5"
-tempfile = "3.2"
-
-
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

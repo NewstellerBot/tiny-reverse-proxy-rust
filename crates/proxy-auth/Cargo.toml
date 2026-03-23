@@ -1,0 +1,23 @@
+[package]
+name = "proxy-auth"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+dashmap = "5"
+hex = "0.4"
+rand = "0.8"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio"], optional = true }
+tracing = "0.1"
+
+[features]
+default = ["store-sqlite"]
+store-sqlite = ["sqlx/sqlite"]
+store-postgres = ["sqlx/postgres"]
+store-mysql = ["sqlx/mysql"]
+
+[dev-dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["full"] }

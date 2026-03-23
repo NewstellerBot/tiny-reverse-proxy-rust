@@ -1,0 +1,13 @@
+[package]
+name = "trp-test-support"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+proxy-core = { path = "../proxy-core" }
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+tempfile = "3.2"
+tokio = { version = "1", features = ["full"] }

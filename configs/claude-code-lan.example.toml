@@ -1,0 +1,23 @@
+port = 8888
+management_api_port = 9090
+management_api_token = "$TRP_BOOTSTRAP_ADMIN_TOKEN"
+store_url = "sqlite:///tmp/claude-code-lan.db"
+allow_direct_provider_keys = false
+
+[paths]
+"/v1/*" = ["https://api.anthropic.com"]
+
+[[providers]]
+name = "anthropic"
+api_key = "$ANTHROPIC_API_KEY"
+base_url = "https://api.anthropic.com"
+models = [
+  "claude-opus-4-20250514",
+  "claude-sonnet-4-20250514",
+  "claude-3-5-haiku-20241022",
+]
+api_key_header = "x-api-key"
+family = "anthropic"
+
+[providers.surfaces]
+tools = "anthropic"

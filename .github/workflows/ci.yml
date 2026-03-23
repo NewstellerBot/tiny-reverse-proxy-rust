@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked --workspace --all-features --exclude semantic-safety-service --exclude semantic-safety-trt --exclude semantic-safety-trt-sys --lib --bins --examples -- -D clippy::correctness -D clippy::suspicious -D clippy::perf -A clippy::result_large_err -A clippy::empty_line_after_doc_comments
+      - run: cargo clippy --locked -p semantic-safety-service --features dev_stub_backend --lib --bins --examples -- -D clippy::correctness -D clippy::suspicious -D clippy::perf -A clippy::result_large_err -A clippy::empty_line_after_doc_comments
+      - run: cargo clippy --locked -p semantic-safety-trt --lib -- -D clippy::correctness -D clippy::suspicious -D clippy::perf -A clippy::result_large_err -A clippy::empty_line_after_doc_comments
+
+  test:
+    name: Workspace Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --workspace
+
+  gateway-otel:
+    name: Gateway OTEL Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p plugin-llm-gateway --features opentelemetry --test otel_compilation
+
+  gateway-real-db:
+    name: Gateway Real DB Round Trips
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: trp_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d trp_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: trp_test
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -proot --silent"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      TRP_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/trp_test
+      TRP_TEST_MYSQL_URL: mysql://root:root@127.0.0.1:3306/trp_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked -p plugin-llm-gateway --features store-postgres,store-mysql --test real_db_store -- --ignored --nocapture
+
+  build-all-features:
+    name: Build Hosted Feature Matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --workspace --all-features --exclude semantic-safety-service --exclude semantic-safety-trt --exclude semantic-safety-trt-sys
+      - run: cargo build --locked -p semantic-safety-service --features dev_stub_backend
+      - run: cargo build --locked -p semantic-safety-trt

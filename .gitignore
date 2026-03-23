@@ -1,3 +1,7 @@
-/target
-config*
+target/
+config.toml
 tarpaulin-report.html
+.tls/
+.DS_Store
+__pycache__/
+bench/oss-gateway-shootout/results*/

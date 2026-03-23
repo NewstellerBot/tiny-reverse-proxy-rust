@@ -1,0 +1,12 @@
+[package]
+name = "semantic-safety-trt"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+native-tensorrt = ["semantic-safety-trt-sys/native-tensorrt"]
+
+[dependencies]
+semantic-safety-trt-sys = { path = "../semantic-safety-trt-sys" }
+tokenizers = "0.20"
