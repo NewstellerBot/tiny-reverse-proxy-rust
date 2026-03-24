@@ -23,7 +23,9 @@ use bytes::Bytes;
 use hyper::header::HeaderMap;
 use hyper::header::{HeaderValue, CONTENT_LENGTH};
 use proxy_auth::service::AuthService;
-use proxy_core::config::{ModelAliasConfig, PluginConfig, ProviderKeyConfig};
+use proxy_core::config::{
+    ModelAliasConfig, PluginConfig, PreviewFeature, PreviewFeatureSet, ProviderKeyConfig,
+};
 use proxy_core::plugin::{Plugin, PluginRegistry, ProviderCandidates, RequestContext};
 use serde::de::{MapAccess, Visitor};
 use serde::Deserialize;
@@ -183,6 +185,39 @@ pub(crate) fn take_request_custom_cost(
     parse_request_custom_cost_header_value(raw).map(Some)
 }
 
+fn collect_preview_features(
+    configs: &[PluginConfig],
+) -> Result<PreviewFeatureSet, Box<dyn std::error::Error>> {
+    let mut features = Vec::new();
+    for plugin in configs {
+        let Some(array) = plugin.config.get("preview_features") else {
+            continue;
+        };
+        let values = array.as_array().ok_or_else(|| {
+            format!(
+                "plugins.{}.config.preview_features must be an array of strings",
+                plugin.name
+            )
+        })?;
+        for (idx, value) in values.iter().enumerate() {
+            let raw = value.as_str().ok_or_else(|| {
+                format!(
+                    "plugins.{}.config.preview_features[{idx}] must be a string",
+                    plugin.name
+                )
+            })?;
+            let feature = PreviewFeature::parse(raw).ok_or_else(|| {
+                format!(
+                    "plugins.{}.config.preview_features[{idx}] has unknown feature '{raw}'",
+                    plugin.name
+                )
+            })?;
+            features.push(feature);
+        }
+    }
+    Ok(PreviewFeatureSet::new(features))
+}
+
 /// Register all LLM gateway plugins with the registry.
 pub fn register_all(registry: &mut PluginRegistry) {
     registry.register("rate_limiter", rate_limiter::create);
@@ -231,6 +266,8 @@ pub async fn create_plugins_with_options(
     options: CreatePluginsOptions,
     registry: Option<&prometheus::Registry>,
 ) -> Result<(Vec<Box<dyn Plugin>>, LlmGatewayApi), Box<dyn std::error::Error>> {
+    let preview_features = collect_preview_features(configs)?;
+
     // Connect to the store if a URL is provided.
     let store = match store_url {
         Some(url) => {
@@ -304,6 +341,12 @@ pub async fn create_plugins_with_options(
     let semantic_cache_position = configs
         .iter()
         .position(|pc| pc.enabled && pc.name == "semantic_cache");
+    let rate_limiter_position = configs.iter().position(|pc| {
+        pc.enabled && (pc.name == "rate_limiter" || pc.name == "token_rate_limiter")
+    });
+    let cost_tracker_position = configs
+        .iter()
+        .position(|pc| pc.enabled && pc.name == "cost_tracker");
     let tool_runtime_position = configs
         .iter()
         .position(|pc| pc.enabled && pc.name == "tool_runtime");
@@ -362,6 +405,26 @@ pub async fn create_plugins_with_options(
         if cache_index > prompt_cache_index {
             return Err(
                 "semantic_cache must be configured before prompt_cache so gateway cache checks happen before provider-specific cache controls"
+                    .into(),
+            );
+        }
+    }
+    if let (Some(rate_limit_index), Some(cache_index)) =
+        (rate_limiter_position, semantic_cache_position)
+    {
+        if rate_limit_index > cache_index {
+            return Err(
+                "rate_limiter must be configured before semantic_cache so per-key admission still runs on cache hits"
+                    .into(),
+            );
+        }
+    }
+    if let (Some(cost_tracker_index), Some(cache_index)) =
+        (cost_tracker_position, semantic_cache_position)
+    {
+        if cost_tracker_index > cache_index {
+            return Err(
+                "cost_tracker must be configured before semantic_cache so usage/cost accounting still runs on cache hits"
                     .into(),
             );
         }
@@ -445,6 +508,7 @@ pub async fn create_plugins_with_options(
                     &pc.config,
                     &effective_providers,
                     Arc::clone(&governance),
+                    preview_features.clone(),
                 )
                 .await?;
                 tool_runtime_handle = Some(runtime.clone());
@@ -514,6 +578,7 @@ pub async fn create_plugins_with_options(
         tool_runtime_handle,
         store,
     )
+    .with_preview_features(preview_features)
     .with_governance(auth_service, governance);
 
     if let Some(ref store) = recovery_store {

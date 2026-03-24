@@ -14,6 +14,10 @@ mod tests {
         ProjectPromptRolloutRecord, ProjectRolloutPolicyRecord, RequestLogEntry,
         SessionEventRecord, SessionListQuery, SessionRecord,
     };
+    use proxy_core::config::{
+        ProviderCommonConfig, ProviderFamily, ProviderFamilyConfig, ProviderKeyConfig,
+        ProviderSurfaceCatalog,
+    };
 
     // -----------------------------------------------------------------------
     // Store CRUD tests (in-memory SQLite)
@@ -1700,8 +1704,28 @@ mod tests {
         use hyper_util::client::legacy::Client;
         use hyper_util::rt::TokioExecutor;
         use plugin_llm_gateway::CreatePluginsOptions;
+        use proxy_core::config::PluginConfig;
         use serde_json::Value;
         use tempfile::NamedTempFile;
+
+        fn openai_provider() -> ProviderKeyConfig {
+            ProviderKeyConfig::new(
+                ProviderCommonConfig {
+                    name: "openai".to_string(),
+                    api_key: "test-key".to_string(),
+                    base_url: "https://api.openai.com".to_string(),
+                    models: vec!["gpt-4o-mini".to_string()],
+                    api_key_header: "authorization".to_string(),
+                    timeout_secs: Some(30),
+                    routing_metadata: Default::default(),
+                },
+                ProviderFamilyConfig::from_parts(
+                    ProviderFamily::OpenAi,
+                    ProviderSurfaceCatalog::default(),
+                )
+                .unwrap(),
+            )
+        }
 
         async fn start_test_server(api: LlmGatewayApi) -> u16 {
             // Bind to port 0 to get an ephemeral port.
@@ -2218,6 +2242,11 @@ mod tests {
             )
             .await
             .unwrap();
+            let create_project_result = api
+                .create_project("project-a", "Project A", None)
+                .await
+                .expect("auth enabled");
+            assert!(create_project_result.is_ok(), "project create failed");
             let port = start_test_server(api).await;
 
             let (status, first_body) = put_with_bearer(
@@ -2271,6 +2300,11 @@ mod tests {
             )
             .await
             .unwrap();
+            let create_project_result = api
+                .create_project("project-a", "Project A", None)
+                .await
+                .expect("auth enabled");
+            assert!(create_project_result.is_ok(), "project create failed");
             let port = start_test_server(api).await;
 
             let (status, body) = put_with_bearer(
@@ -2319,6 +2353,11 @@ mod tests {
             )
             .await
             .unwrap();
+            let create_project_result = api
+                .create_project("project-a", "Project A", None)
+                .await
+                .expect("auth enabled");
+            assert!(create_project_result.is_ok(), "project create failed");
             let port = start_test_server(api).await;
 
             let payload = serde_json::json!({
@@ -5691,6 +5730,504 @@ mod tests {
             assert!(filtered
                 .iter()
                 .all(|change| change["resource_type"].as_str() == Some("project_tool")));
+        }
+
+        #[tokio::test]
+        async fn project_config_management_apply_validate_and_rollback_round_trip() {
+            let mgmt_token = "test-bootstrap-admin";
+            let providers = vec![openai_provider()];
+            let (_, api) = plugin_llm_gateway::create_plugins_with_options(
+                &[],
+                Some("sqlite::memory:"),
+                &providers,
+                &[],
+                CreatePluginsOptions {
+                    bootstrap_admin_token: Some(mgmt_token.to_string()),
+                    allow_direct_provider_keys: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let create_project_result = api
+                .create_project("project-a", "Project A", None)
+                .await
+                .expect("auth enabled");
+            assert!(create_project_result.is_ok(), "project create failed");
+            let port = start_test_server(api).await;
+
+            let (status, body) = put_with_bearer(
+                port,
+                "/api/v1/projects/project-a/policy",
+                r#"{"budget_limit":10.0,"fallback_order":["openai"]}"#,
+                mgmt_token,
+            )
+            .await;
+            assert_eq!(status, 200, "policy seed failed: {body}");
+
+            let (status, body) = post_with_bearer(
+                port,
+                "/api/v1/projects/project-a/routing-rules",
+                r#"{"name":"route-a","provider_order":["openai"]}"#,
+                mgmt_token,
+            )
+            .await;
+            assert_eq!(status, 201, "routing rule seed failed: {body}");
+
+            let tool_a = serde_json::json!({
+                "description": "Search docs",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "query": { "type": "string" } },
+                    "required": ["query"]
+                },
+                "executor_kind": "webhook",
+                "executor_config": {
+                    "url": "http://tool.local/search",
+                    "method": "POST"
+                },
+                "enabled": true
+            })
+            .to_string();
+            let (status, body) = put_with_bearer(
+                port,
+                "/api/v1/projects/project-a/tools/search",
+                &tool_a,
+                mgmt_token,
+            )
+            .await;
+            assert_eq!(status, 200, "tool seed failed: {body}");
+
+            let prompt_v1 = serde_json::json!({
+                "environment": "prod",
+                "target": "system",
+                "template_text": "Prompt A",
+                "active": true
+            })
+            .to_string();
+            let (status, body) = put_with_bearer(
+                port,
+                "/api/v1/projects/project-a/prompts/support/versions/v1",
+                &prompt_v1,
+                mgmt_token,
+            )
+            .await;
+            assert_eq!(status, 200, "prompt seed failed: {body}");
+
+            let (status, body) =
+                get_with_bearer(port, "/api/v1/projects/project-a/config/export", mgmt_token).await;
+            assert_eq!(status, 200, "config export failed: {body}");
+            let snapshot_a: Value = serde_json::from_str(&body).expect("snapshot a json");
+            assert_eq!(snapshot_a["policy"]["budget_limit"].as_f64(), Some(10.0));
+            assert_eq!(snapshot_a["tools"][0]["tool_name"].as_str(), Some("search"));
+
+            let mut invalid_snapshot = snapshot_a.clone();
+            invalid_snapshot["routing_rules"][0]["provider_order"] =
+                Value::String("[\"missing-provider\"]".to_string());
+            let (status, body) = post_with_bearer(
+                port,
+                "/api/v1/projects/project-a/config/validate",
+                &invalid_snapshot.to_string(),
+                mgmt_token,
+            )
+            .await;
+            assert_eq!(status, 400, "validate should fail: {body}");
+            assert!(
+                body.contains("missing-provider"),
+                "unexpected validate error body: {body}"
+            );
+
+            let (status, body) =
+                get_with_bearer(port, "/api/v1/projects/project-a/config/export", mgmt_token).await;
+            assert_eq!(status, 200);
+            let snapshot_after_failed_validate: Value =
+                serde_json::from_str(&body).expect("export after failed validate");
+            assert_eq!(snapshot_after_failed_validate, snapshot_a);
+
+            let (status, body) = put_with_bearer(
+                port,
+                "/api/v1/projects/project-a/policy",
+                r#"{"budget_limit":20.0,"fallback_order":["openai"]}"#,
+                mgmt_token,
+            )
+            .await;
+            assert_eq!(status, 200, "policy update failed: {body}");
+
+            let (status, body) =
+                delete_with_bearer(port, "/api/v1/projects/project-a/tools/search", mgmt_token)
+                    .await;
+            assert_eq!(status, 200, "tool delete failed: {body}");
+
+            let tool_b = serde_json::json!({
+                "description": "Calculator",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "expression": { "type": "string" } },
+                    "required": ["expression"]
+                },
+                "executor_kind": "webhook",
+                "executor_config": {
+                    "url": "http://tool.local/calc",
+                    "method": "POST"
+                },
+                "enabled": true
+            })
+            .to_string();
+            let (status, body) = put_with_bearer(
+                port,
+                "/api/v1/projects/project-a/tools/calc",
+                &tool_b,
+                mgmt_token,
+            )
+            .await;
+            assert_eq!(status, 200, "replacement tool failed: {body}");
+
+            let prompt_v2 = serde_json::json!({
+                "environment": "prod",
+                "target": "system",
+                "template_text": "Prompt B",
+                "active": true
+            })
+            .to_string();
+            let (status, body) = put_with_bearer(
+                port,
+                "/api/v1/projects/project-a/prompts/support/versions/v2",
+                &prompt_v2,
+                mgmt_token,
+            )
+            .await;
+            assert_eq!(status, 200, "prompt v2 failed: {body}");
+
+            let (status, body) = post_with_bearer(
+                port,
+                "/api/v1/projects/project-a/routing-rules",
+                r#"{"name":"route-b","provider_order":["openai"]}"#,
+                mgmt_token,
+            )
+            .await;
+            assert_eq!(status, 201, "second routing rule failed: {body}");
+
+            let (status, body) =
+                get_with_bearer(port, "/api/v1/projects/project-a/revisions", mgmt_token).await;
+            assert_eq!(status, 200, "revision list failed: {body}");
+            let revisions_before_apply: Value =
+                serde_json::from_str(&body).expect("revisions before apply");
+            let b_revision_id = revisions_before_apply["active_revision_id"]
+                .as_str()
+                .expect("active revision before apply")
+                .to_string();
+
+            let (status, body) = put_with_bearer(
+                port,
+                "/api/v1/projects/project-a/config",
+                &snapshot_a.to_string(),
+                mgmt_token,
+            )
+            .await;
+            assert_eq!(status, 200, "config apply failed: {body}");
+            let apply_json: Value = serde_json::from_str(&body).expect("apply response");
+            let apply_revision_id = apply_json["revision"]["revision_id"]
+                .as_str()
+                .expect("apply revision id")
+                .to_string();
+            assert_ne!(apply_revision_id, b_revision_id);
+            assert_eq!(
+                apply_json["state"]["active_revision_id"].as_str(),
+                Some(apply_revision_id.as_str())
+            );
+
+            let (status, body) =
+                get_with_bearer(port, "/api/v1/projects/project-a/policy", mgmt_token).await;
+            assert_eq!(status, 200);
+            let policy_json: Value = serde_json::from_str(&body).expect("policy after apply");
+            assert_eq!(policy_json["budget_limit"].as_f64(), Some(10.0));
+
+            let (status, _) =
+                get_with_bearer(port, "/api/v1/projects/project-a/tools/search", mgmt_token).await;
+            assert_eq!(status, 200, "search tool should be restored");
+            let (status, _) =
+                get_with_bearer(port, "/api/v1/projects/project-a/tools/calc", mgmt_token).await;
+            assert_eq!(status, 404, "calc tool should be removed");
+            let (status, _) = get_with_bearer(
+                port,
+                "/api/v1/projects/project-a/prompts/support/versions/v2",
+                mgmt_token,
+            )
+            .await;
+            assert_eq!(status, 404, "prompt v2 should be removed");
+
+            let (status, body) =
+                get_with_bearer(port, "/api/v1/projects/project-a/routing-rules", mgmt_token).await;
+            assert_eq!(status, 200);
+            let rules_after_apply: Value = serde_json::from_str(&body).expect("rules after apply");
+            let rules_after_apply = rules_after_apply["rules"].as_array().expect("rules array");
+            assert_eq!(rules_after_apply.len(), 1);
+            assert_eq!(rules_after_apply[0]["name"].as_str(), Some("route-a"));
+
+            let rollback_path =
+                format!("/api/v1/projects/project-a/revisions/{b_revision_id}/rollback");
+            let (status, body) = post_with_bearer(port, &rollback_path, "{}", mgmt_token).await;
+            assert_eq!(status, 200, "rollback failed: {body}");
+            let rollback_json: Value = serde_json::from_str(&body).expect("rollback response");
+            let rollback_revision_id = rollback_json["revision"]["revision_id"]
+                .as_str()
+                .expect("rollback revision id")
+                .to_string();
+            assert_eq!(
+                rollback_json["state"]["active_revision_id"].as_str(),
+                Some(rollback_revision_id.as_str())
+            );
+
+            let (status, body) =
+                get_with_bearer(port, "/api/v1/projects/project-a/policy", mgmt_token).await;
+            assert_eq!(status, 200);
+            let policy_json: Value = serde_json::from_str(&body).expect("policy after rollback");
+            assert_eq!(policy_json["budget_limit"].as_f64(), Some(20.0));
+
+            let (status, _) =
+                get_with_bearer(port, "/api/v1/projects/project-a/tools/search", mgmt_token).await;
+            assert_eq!(
+                status, 404,
+                "search tool should stay deleted after rollback"
+            );
+            let (status, _) =
+                get_with_bearer(port, "/api/v1/projects/project-a/tools/calc", mgmt_token).await;
+            assert_eq!(status, 200, "calc tool should be restored after rollback");
+            let (status, _) = get_with_bearer(
+                port,
+                "/api/v1/projects/project-a/prompts/support/versions/v2",
+                mgmt_token,
+            )
+            .await;
+            assert_eq!(status, 200, "prompt v2 should be restored");
+
+            let (status, body) =
+                get_with_bearer(port, "/api/v1/projects/project-a/routing-rules", mgmt_token).await;
+            assert_eq!(status, 200);
+            let rules_after_rollback: Value =
+                serde_json::from_str(&body).expect("rules after rollback");
+            let rules_after_rollback = rules_after_rollback["rules"]
+                .as_array()
+                .expect("rules array");
+            assert_eq!(rules_after_rollback.len(), 2);
+
+            let revision_path = format!("/api/v1/projects/project-a/revisions/{b_revision_id}");
+            let (status, body) = get_with_bearer(port, &revision_path, mgmt_token).await;
+            assert_eq!(status, 200, "revision lookup failed: {body}");
+            let revision_json: Value = serde_json::from_str(&body).expect("revision lookup json");
+            assert_eq!(revision_json["is_active"].as_bool(), Some(false));
+            assert_eq!(revision_json["is_last_known_good"].as_bool(), Some(false));
+        }
+
+        #[tokio::test]
+        async fn control_plane_export_validate_and_import_round_trip() {
+            let mgmt_token = "test-bootstrap-admin";
+            let providers = vec![openai_provider()];
+            let preview_configs = vec![PluginConfig {
+                name: "tool_runtime".to_string(),
+                enabled: false,
+                config: toml::Value::Table({
+                    let mut table = toml::value::Map::new();
+                    table.insert(
+                        "preview_features".to_string(),
+                        toml::Value::Array(vec![toml::Value::String(
+                            "control_plane_import".to_string(),
+                        )]),
+                    );
+                    table
+                }),
+            }];
+            unsafe {
+                std::env::set_var("BETA_API_KEY", "test-managed-provider-key");
+            }
+            let (_, source_api) = plugin_llm_gateway::create_plugins_with_options(
+                &preview_configs,
+                Some("sqlite::memory:"),
+                &providers,
+                &[],
+                CreatePluginsOptions {
+                    bootstrap_admin_token: Some(mgmt_token.to_string()),
+                    allow_direct_provider_keys: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            source_api
+                .create_project("project-a", "Project A", None)
+                .await
+                .expect("auth enabled")
+                .expect("project create");
+            source_api
+                .upsert_managed_provider(ManagedProviderRecord {
+                    name: "beta".to_string(),
+                    enabled: true,
+                    api_key_env: Some("BETA_API_KEY".to_string()),
+                    base_url: Some("https://beta.example".to_string()),
+                    models_json: Some(r#"["beta-model"]"#.to_string()),
+                    api_key_header: Some("authorization".to_string()),
+                    timeout_secs: Some(30),
+                    family: Some("openai".to_string()),
+                    surfaces_json: Some(
+                        serde_json::to_string(&ProviderSurfaceCatalog::default())
+                            .expect("surface json"),
+                    ),
+                    routing_metadata_json: None,
+                    created_at: current_timestamp_string(),
+                    updated_at: current_timestamp_string(),
+                })
+                .await
+                .expect("virtual keys enabled")
+                .expect("managed provider upsert");
+            source_api
+                .upsert_project_policy(plugin_llm_gateway::store::ProjectPolicyRecord {
+                    project_id: "project-a".to_string(),
+                    budget_limit: Some(42.0),
+                    budget_duration: None,
+                    rpm_limit: None,
+                    tpm_limit: None,
+                    fallback_order: Some(r#"["beta"]"#.to_string()),
+                    adaptive_enabled: true,
+                    timeout_secs: None,
+                    provider_rpm_limits: None,
+                    provider_tpm_limits: None,
+                    provider_timeouts: None,
+                    provider_input_costs: None,
+                    provider_output_costs: None,
+                    semantic_cache_enabled: None,
+                    semantic_cache_ttl_secs: None,
+                    semantic_cache_similarity_threshold: None,
+                    tool_approval_mode: None,
+                    allowed_tools: None,
+                    updated_at: current_timestamp_string(),
+                })
+                .await
+                .expect("governance enabled")
+                .expect("policy upsert");
+            source_api
+                .create_virtual_key(
+                    Some("project-a"),
+                    "backup-key",
+                    "beta",
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(vec!["beta-model".to_string()]),
+                    None,
+                )
+                .await
+                .expect("virtual keys enabled")
+                .expect("virtual key create");
+            let source_port = start_test_server(source_api).await;
+
+            let (status, body) =
+                get_with_bearer(source_port, "/api/v1/control-plane/export", mgmt_token).await;
+            assert_eq!(status, 200, "control plane export failed: {body}");
+            let snapshot_json: Value = serde_json::from_str(&body).expect("control plane json");
+            assert_eq!(snapshot_json["projects"].as_array().map(Vec::len), Some(1));
+            assert_eq!(
+                snapshot_json["managed_providers"][0]["name"].as_str(),
+                Some("beta")
+            );
+            assert_eq!(
+                snapshot_json["virtual_keys"][0]["provider_name"].as_str(),
+                Some("beta")
+            );
+
+            let (_, destination_api) = plugin_llm_gateway::create_plugins_with_options(
+                &preview_configs,
+                Some("sqlite::memory:"),
+                &providers,
+                &[],
+                CreatePluginsOptions {
+                    bootstrap_admin_token: Some(mgmt_token.to_string()),
+                    allow_direct_provider_keys: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let destination_port = start_test_server(destination_api).await;
+
+            let (status, body) = post_with_bearer(
+                destination_port,
+                "/api/v1/control-plane/validate",
+                &snapshot_json.to_string(),
+                mgmt_token,
+            )
+            .await;
+            assert_eq!(status, 200, "control plane validate failed: {body}");
+
+            let (status, body) = put_with_bearer(
+                destination_port,
+                "/api/v1/control-plane/import",
+                &snapshot_json.to_string(),
+                mgmt_token,
+            )
+            .await;
+            assert_eq!(status, 200, "control plane import failed: {body}");
+
+            let (status, body) = get_with_bearer(
+                destination_port,
+                "/api/v1/projects/project-a/policy",
+                mgmt_token,
+            )
+            .await;
+            assert_eq!(status, 200);
+            let policy_json: Value = serde_json::from_str(&body).expect("restored policy");
+            assert_eq!(policy_json["budget_limit"].as_f64(), Some(42.0));
+            assert_eq!(policy_json["fallback_order"][0].as_str(), Some("beta"));
+
+            let (status, body) =
+                get_with_bearer(destination_port, "/api/v1/providers/beta", mgmt_token).await;
+            assert_eq!(status, 200, "restored provider missing: {body}");
+
+            let (status, body) =
+                get_with_bearer(destination_port, "/api/v1/keys", mgmt_token).await;
+            assert_eq!(status, 200);
+            let keys_json: Value = serde_json::from_str(&body).expect("restored keys");
+            let keys = keys_json["keys"].as_array().expect("keys array");
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys[0]["provider_name"].as_str(), Some("beta"));
+            assert_eq!(keys[0]["project_id"].as_str(), Some("project-a"));
+        }
+
+        #[tokio::test]
+        async fn control_plane_import_requires_preview_feature() {
+            let mgmt_token = "test-bootstrap-admin";
+            let providers = vec![openai_provider()];
+            let (_, api) = plugin_llm_gateway::create_plugins_with_options(
+                &[],
+                Some("sqlite::memory:"),
+                &providers,
+                &[],
+                CreatePluginsOptions {
+                    bootstrap_admin_token: Some(mgmt_token.to_string()),
+                    allow_direct_provider_keys: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let port = start_test_server(api).await;
+            let snapshot = serde_json::json!({
+                "exported_at": "2026-03-23T00:00:00Z",
+                "projects": [],
+                "managed_providers": [],
+                "virtual_keys": [],
+                "project_configs": [],
+            });
+
+            let (status, body) = put_with_bearer(
+                port,
+                "/api/v1/control-plane/import",
+                &snapshot.to_string(),
+                mgmt_token,
+            )
+            .await;
+            assert_eq!(status, 400, "unexpected import status: {body}");
+            assert!(body.contains("control_plane_import"), "{body}");
         }
 
         #[tokio::test]

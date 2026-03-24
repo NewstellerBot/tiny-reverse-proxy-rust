@@ -1,0 +1,38 @@
+name: Feature request
+description: Propose new behavior or support.
+title: "[feature] "
+labels:
+  - needs-design
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or operator problem does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Describe the desired behavior at a high level.
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Change category
+      options:
+        - New provider family
+        - New endpoint family
+        - Control-plane mutation model
+        - Preview feature
+        - Hot-path architecture change
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds exist today?

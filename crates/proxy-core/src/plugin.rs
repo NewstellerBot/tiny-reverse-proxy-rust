@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +25,62 @@ pub struct ProviderCandidate {
 /// List of provider candidates, injected by VirtualKeys for cross-provider retry.
 #[derive(Clone, Debug, Default)]
 pub struct ProviderCandidates(pub Vec<ProviderCandidate>);
+
+/// Request-scoped brownout hint injected by the core proxy when local admission
+/// thresholds indicate that optional features should degrade.
+#[derive(Clone, Debug, Default)]
+pub struct BrownoutMode {
+    pub disable_prompt_cache: bool,
+    pub disable_semantic_cache: bool,
+    pub disable_semantic_safety: bool,
+    pub disable_managed_tools: bool,
+}
+
+impl BrownoutMode {
+    pub fn active(&self) -> bool {
+        self.disable_prompt_cache
+            || self.disable_semantic_cache
+            || self.disable_semantic_safety
+            || self.disable_managed_tools
+    }
+}
+
+/// Shared retry budget for request-local upstream retries and provider follow-up
+/// turns initiated by plugins.
+#[derive(Clone, Debug)]
+pub struct RequestRetryBudget {
+    remaining_attempts: Arc<AtomicUsize>,
+}
+
+impl RequestRetryBudget {
+    pub fn new(remaining_attempts: usize) -> Self {
+        Self {
+            remaining_attempts: Arc::new(AtomicUsize::new(remaining_attempts)),
+        }
+    }
+
+    pub fn remaining_attempts(&self) -> usize {
+        self.remaining_attempts.load(Ordering::Relaxed)
+    }
+
+    pub fn try_consume_attempt(&self) -> bool {
+        let mut current = self.remaining_attempts.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                return false;
+            }
+            match self.remaining_attempts.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(updated) => current = updated,
+            }
+        }
+    }
+}
 
 /// Error type passed to the `on_error` hook.
 #[derive(Debug)]

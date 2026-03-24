@@ -1,6 +1,6 @@
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder,
+    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 use std::sync::Arc;
 
@@ -19,6 +19,11 @@ pub struct Metrics {
     pub request_duration_seconds: HistogramVec,
     pub active_connections: IntGauge,
     pub upstream_healthy: IntGaugeVec,
+    pub retry_attempts_total: IntCounterVec,
+    pub retry_exhaustions_total: IntCounterVec,
+    pub admission_rejections_total: IntCounter,
+    pub brownout_active: IntGauge,
+    pub brownout_activations_total: IntCounter,
 }
 
 impl Metrics {
@@ -73,12 +78,68 @@ impl Metrics {
             .register(Box::new(upstream_healthy.clone()))
             .expect("failed to register proxy_upstream_healthy");
 
+        let retry_attempts_total = IntCounterVec::new(
+            Opts::new(
+                "proxy_retry_attempts_total",
+                "Total number of retry or provider failover attempts",
+            ),
+            &["mode", "reason"],
+        )
+        .expect("failed to create proxy_retry_attempts_total counter");
+        registry
+            .register(Box::new(retry_attempts_total.clone()))
+            .expect("failed to register proxy_retry_attempts_total");
+
+        let retry_exhaustions_total = IntCounterVec::new(
+            Opts::new(
+                "proxy_retry_exhaustions_total",
+                "Total number of requests that exhausted retry or failover opportunities",
+            ),
+            &["mode", "reason"],
+        )
+        .expect("failed to create proxy_retry_exhaustions_total counter");
+        registry
+            .register(Box::new(retry_exhaustions_total.clone()))
+            .expect("failed to register proxy_retry_exhaustions_total");
+
+        let admission_rejections_total = IntCounter::new(
+            "proxy_admission_rejections_total",
+            "Total number of requests rejected by hard admission control",
+        )
+        .expect("failed to create proxy_admission_rejections_total counter");
+        registry
+            .register(Box::new(admission_rejections_total.clone()))
+            .expect("failed to register proxy_admission_rejections_total");
+
+        let brownout_active = IntGauge::new(
+            "proxy_brownout_active",
+            "Whether local brownout mode is currently active (1) or not (0)",
+        )
+        .expect("failed to create proxy_brownout_active gauge");
+        registry
+            .register(Box::new(brownout_active.clone()))
+            .expect("failed to register proxy_brownout_active");
+
+        let brownout_activations_total = IntCounter::new(
+            "proxy_brownout_activations_total",
+            "Total number of times local brownout mode was activated",
+        )
+        .expect("failed to create proxy_brownout_activations_total counter");
+        registry
+            .register(Box::new(brownout_activations_total.clone()))
+            .expect("failed to register proxy_brownout_activations_total");
+
         Self {
             registry: Arc::new(registry),
             requests_total,
             request_duration_seconds,
             active_connections,
             upstream_healthy,
+            retry_attempts_total,
+            retry_exhaustions_total,
+            admission_rejections_total,
+            brownout_active,
+            brownout_activations_total,
         }
     }
 
@@ -91,6 +152,30 @@ impl Metrics {
             .expect("failed to encode metrics");
         String::from_utf8(buffer).expect("metrics output is not valid UTF-8")
     }
+
+    pub fn record_retry_attempt(&self, mode: &str, reason: &str) {
+        self.retry_attempts_total
+            .with_label_values(&[mode, reason])
+            .inc();
+    }
+
+    pub fn record_retry_exhaustion(&self, mode: &str, reason: &str) {
+        self.retry_exhaustions_total
+            .with_label_values(&[mode, reason])
+            .inc();
+    }
+
+    pub fn record_admission_rejection(&self) {
+        self.admission_rejections_total.inc();
+    }
+
+    pub fn set_brownout_active(&self, active: bool) {
+        self.brownout_active.set(if active { 1 } else { 0 });
+    }
+
+    pub fn record_brownout_activation(&self) {
+        self.brownout_activations_total.inc();
+    }
 }
 
 impl Default for Metrics {
@@ -102,12 +187,21 @@ impl Default for Metrics {
 /// Start a metrics HTTP server on the given port.
 /// This runs a simple TCP listener serving the /metrics endpoint.
 pub async fn start_metrics_server(port: u16, metrics: Metrics) {
-    let listener = TcpListener::bind(("0.0.0.0", port))
+    let listener = bind_metrics_listener(port)
         .await
         .expect("failed to bind metrics server");
+    serve_metrics_listener(listener, metrics).await;
+}
 
-    tracing::info!(port, "metrics server listening");
+pub async fn bind_metrics_listener(port: u16) -> std::io::Result<TcpListener> {
+    TcpListener::bind(("0.0.0.0", port)).await
+}
 
+pub async fn serve_metrics_listener(listener: TcpListener, metrics: Metrics) {
+    tracing::info!(
+        port = listener.local_addr().ok().map(|addr| addr.port()),
+        "metrics server listening"
+    );
     loop {
         let (stream, _addr) = match listener.accept().await {
             Ok(conn) => conn,
@@ -184,6 +278,11 @@ mod tests {
             .upstream_healthy
             .with_label_values(&["backend-1"])
             .set(1);
+        metrics.record_retry_attempt("core", "5xx");
+        metrics.record_retry_exhaustion("provider", "timeout");
+        metrics.record_admission_rejection();
+        metrics.record_brownout_activation();
+        metrics.set_brownout_active(true);
 
         let output = metrics.encode();
 
@@ -202,6 +301,26 @@ mod tests {
         assert!(
             output.contains("proxy_upstream_healthy"),
             "output should contain proxy_upstream_healthy"
+        );
+        assert!(
+            output.contains("proxy_retry_attempts_total"),
+            "output should contain proxy_retry_attempts_total"
+        );
+        assert!(
+            output.contains("proxy_retry_exhaustions_total"),
+            "output should contain proxy_retry_exhaustions_total"
+        );
+        assert!(
+            output.contains("proxy_admission_rejections_total"),
+            "output should contain proxy_admission_rejections_total"
+        );
+        assert!(
+            output.contains("proxy_brownout_active"),
+            "output should contain proxy_brownout_active"
+        );
+        assert!(
+            output.contains("proxy_brownout_activations_total"),
+            "output should contain proxy_brownout_activations_total"
         );
 
         // Verify specific label values appear

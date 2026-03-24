@@ -1,0 +1,46 @@
+name: Release Soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: Soak duration in minutes
+        required: false
+        default: "120"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    name: Mixed Mock And Live RC Soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    environment: release-live-openai
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v6
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Require release branch
+        run: |
+          if [[ "${GITHUB_REF_NAME}" != release/* ]]; then
+            echo "Release soak only runs from release/* branches"
+            exit 1
+          fi
+
+      - name: Build gateway binary for soak
+        run: cargo build --locked -p tiny-reverse-proxy --features plugin-llm-gateway
+
+      - name: Run soak harness
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_ORGANIZATION: ${{ secrets.OPENAI_ORGANIZATION }}
+          OPENAI_PROJECT: ${{ secrets.OPENAI_PROJECT }}
+        run: |
+          DURATION_SECS=$(( ${{ inputs.duration_minutes }} * 60 ))
+          uv run python bench/reliability/soak_runner.py --duration-secs "${DURATION_SECS}"

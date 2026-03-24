@@ -1,3 +1,8 @@
+//! Provider prompt-cache routing and advisory prompt-cache hints.
+//!
+//! The routing memory in this module is node-local and advisory. Persisted routing hints improve
+//! warm starts, but store-backed project/provider configuration remains the source of truth.
+
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,7 +22,7 @@ use proxy_core::config::{
     PromptCacheProtocol as SharedPromptCacheProtocol, ProviderExtraCapability, ProviderKeyConfig,
     ProviderPromptCacheSemantics, ProviderRuntimeSemantics, ProviderSurfaceCatalog,
 };
-use proxy_core::plugin::{Action, Plugin, RequestContext, ResponseContext};
+use proxy_core::plugin::{Action, BrownoutMode, Plugin, RequestContext, ResponseContext};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
@@ -482,6 +487,7 @@ pub struct PromptCacheUsage {
 pub struct PromptCacheProviderSnapshot {
     pub name: String,
     pub family: String,
+    pub stability: String,
     pub surfaces: ProviderSurfaceCatalog,
     #[serde(flatten)]
     pub semantics: ProviderRuntimeSemantics,
@@ -726,6 +732,7 @@ impl PromptCache {
             .map(|provider| PromptCacheProviderSnapshot {
                 name: provider.name.clone(),
                 family: provider.family_kind().as_str().to_string(),
+                stability: provider.stability().as_str().to_string(),
                 surfaces: provider.surfaces().clone(),
                 semantics: provider.runtime_semantics(),
                 prompt_cache: provider.prompt_cache_semantics(),
@@ -829,6 +836,14 @@ impl Plugin for PromptCache {
     }
 
     async fn on_request(&self, ctx: &mut RequestContext) -> Action {
+        if ctx
+            .extensions
+            .get::<BrownoutMode>()
+            .map(|mode| mode.disable_prompt_cache)
+            .unwrap_or(false)
+        {
+            return Action::Continue;
+        }
         let Some(virtual_key) = ctx.extensions.get::<VirtualKeyMeta>().cloned() else {
             return Action::Continue;
         };

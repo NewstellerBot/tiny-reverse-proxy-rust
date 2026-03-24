@@ -1,0 +1,47 @@
+{
+  "scenario_id": "images_native_fallback_incompatible_field",
+  "request": {
+    "method": "POST",
+    "path": "/v1/images/generations",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "model": "gpt-image-1",
+      "prompt": "paint a storm",
+      "quality": "high"
+    }
+  },
+  "provider_context": {
+    "family": "openrouter",
+    "surfaced_protocol": "openrouter_chat_images",
+    "request_mode": "native_fallback"
+  },
+  "upstream_response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "created": 123,
+      "data": [
+        {
+          "b64_json": "bmF0aXZl"
+        }
+      ]
+    }
+  },
+  "expected_upstream": {
+    "path": "/v1/images/generations",
+    "body_contains": [
+      "\"quality\":\"high\"",
+      "\"prompt\":\"paint a storm\""
+    ]
+  },
+  "expected_client": {
+    "status": 200,
+    "body_contains": [
+      "\"b64_json\":\"bmF0aXZl\""
+    ]
+  }
+}

@@ -1,5 +1,6 @@
 use glob::Pattern;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs;
 
 /// Resolve a string value: if it starts with `$`, look up the env var.
@@ -52,10 +53,147 @@ pub struct CacheConfig {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ReliabilityConfig {
+    pub max_inflight_requests: Option<u32>,
+    pub brownout_inflight_requests: Option<u32>,
+    pub retry_budget_per_request: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct PluginConfig {
     pub name: String,
     pub enabled: bool,
     pub config: toml::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum PreviewFeature {
+    #[serde(rename = "responses_composed_streaming")]
+    ResponsesComposedStreaming,
+    #[serde(rename = "control_plane_import")]
+    ControlPlaneImport,
+    #[serde(rename = "provider_surface_translations")]
+    ProviderSurfaceTranslations,
+}
+
+impl PreviewFeature {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "responses_composed_streaming" => Some(Self::ResponsesComposedStreaming),
+            "control_plane_import" => Some(Self::ControlPlaneImport),
+            "provider_surface_translations" => Some(Self::ProviderSurfaceTranslations),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ResponsesComposedStreaming => "responses_composed_streaming",
+            Self::ControlPlaneImport => "control_plane_import",
+            Self::ProviderSurfaceTranslations => "provider_surface_translations",
+        }
+    }
+
+    pub fn enforcement(&self) -> PreviewFeatureEnforcement {
+        match self {
+            Self::ResponsesComposedStreaming | Self::ControlPlaneImport => {
+                PreviewFeatureEnforcement::HardGate
+            }
+            Self::ProviderSurfaceTranslations => PreviewFeatureEnforcement::VisibilityOnly,
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        const ALL: &[PreviewFeature] = &[
+            PreviewFeature::ResponsesComposedStreaming,
+            PreviewFeature::ControlPlaneImport,
+            PreviewFeature::ProviderSurfaceTranslations,
+        ];
+        ALL
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PreviewFeatureEnforcement {
+    #[serde(rename = "hard_gate")]
+    HardGate,
+    #[serde(rename = "visibility_only")]
+    VisibilityOnly,
+}
+
+impl PreviewFeatureEnforcement {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::HardGate => "hard_gate",
+            Self::VisibilityOnly => "visibility_only",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewFeatureStatus {
+    pub name: String,
+    pub enabled: bool,
+    pub enforcement: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PreviewFeatureSet {
+    features: BTreeSet<PreviewFeature>,
+}
+
+impl PreviewFeatureSet {
+    pub fn new(features: impl IntoIterator<Item = PreviewFeature>) -> Self {
+        Self {
+            features: features.into_iter().collect(),
+        }
+    }
+
+    pub fn contains(&self, feature: PreviewFeature) -> bool {
+        self.features.contains(&feature)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.features.is_empty()
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.features
+            .iter()
+            .map(|feature| feature.as_str().to_string())
+            .collect()
+    }
+
+    pub fn statuses(&self) -> Vec<PreviewFeatureStatus> {
+        PreviewFeature::all()
+            .iter()
+            .map(|feature| PreviewFeatureStatus {
+                name: feature.as_str().to_string(),
+                enabled: self.contains(*feature),
+                enforcement: feature.enforcement().as_str().to_string(),
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StabilityLevel {
+    #[serde(rename = "stable")]
+    Stable,
+    #[serde(rename = "preview")]
+    Preview,
+    #[serde(rename = "experimental")]
+    Experimental,
+}
+
+impl StabilityLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Preview => "preview",
+            Self::Experimental => "experimental",
+        }
+    }
 }
 
 /// Configuration for an LLM provider (e.g. OpenAI, Anthropic).
@@ -99,6 +237,14 @@ impl ProviderFamily {
             Self::Gemini => "gemini",
             Self::OpenRouter => "openrouter",
             Self::Custom => "custom",
+        }
+    }
+
+    pub fn stability(&self) -> StabilityLevel {
+        match self {
+            Self::OpenAi => StabilityLevel::Stable,
+            Self::Anthropic | Self::Gemini | Self::OpenRouter => StabilityLevel::Preview,
+            Self::Custom => StabilityLevel::Experimental,
         }
     }
 }
@@ -1100,6 +1246,10 @@ impl ProviderKeyConfig {
         self.family.family()
     }
 
+    pub fn stability(&self) -> StabilityLevel {
+        self.family_kind().stability()
+    }
+
     pub fn surfaces(&self) -> &ProviderSurfaceCatalog {
         self.family.surfaces()
     }
@@ -1652,6 +1802,8 @@ pub struct Config {
     pub compression_enabled: bool,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     pub cache: Option<CacheConfig>,
+    pub reliability: ReliabilityConfig,
+    pub preview_features: PreviewFeatureSet,
     pub proxy_protocol: bool,
     pub plugins: Vec<PluginConfig>,
     pub providers: Vec<ProviderKeyConfig>,
@@ -1741,6 +1893,26 @@ impl Config {
         if let Some(ref c) = self.cache {
             if c.max_size_mb == 0 {
                 errors.push("cache.max_size_mb must be > 0".to_string());
+            }
+        }
+
+        if let Some(max) = self.reliability.max_inflight_requests {
+            if max == 0 {
+                errors.push("reliability.max_inflight_requests must be > 0".to_string());
+            }
+        }
+
+        if let Some(brownout) = self.reliability.brownout_inflight_requests {
+            if brownout == 0 {
+                errors.push("reliability.brownout_inflight_requests must be > 0".to_string());
+            }
+            if let Some(max) = self.reliability.max_inflight_requests {
+                if brownout > max {
+                    errors.push(
+                        "reliability.brownout_inflight_requests must be <= reliability.max_inflight_requests"
+                            .to_string(),
+                    );
+                }
             }
         }
 
@@ -2008,6 +2180,53 @@ impl Config {
             None
         };
 
+        let reliability = if let Some(section) = parsed.get("reliability") {
+            ReliabilityConfig {
+                max_inflight_requests: section
+                    .get("max_inflight_requests")
+                    .and_then(|v| v.as_integer())
+                    .map(|v| parse_u32(v, "reliability.max_inflight_requests"))
+                    .transpose()?,
+                brownout_inflight_requests: section
+                    .get("brownout_inflight_requests")
+                    .and_then(|v| v.as_integer())
+                    .map(|v| parse_u32(v, "reliability.brownout_inflight_requests"))
+                    .transpose()?,
+                retry_budget_per_request: parse_u32(
+                    section
+                        .get("retry_budget_per_request")
+                        .and_then(|v| v.as_integer())
+                        .unwrap_or(2),
+                    "reliability.retry_budget_per_request",
+                )?,
+            }
+        } else {
+            ReliabilityConfig {
+                max_inflight_requests: None,
+                brownout_inflight_requests: None,
+                retry_budget_per_request: 2,
+            }
+        };
+
+        let preview_features = if let Some(values) = parsed.get("preview_features") {
+            let array = values
+                .as_array()
+                .ok_or("preview_features must be an array of strings")?;
+            let mut features = Vec::with_capacity(array.len());
+            for (idx, value) in array.iter().enumerate() {
+                let raw = value
+                    .as_str()
+                    .ok_or_else(|| format!("preview_features[{idx}] must be a string"))?;
+                let feature = PreviewFeature::parse(raw).ok_or_else(|| {
+                    format!("preview_features[{idx}] has unknown feature '{raw}'")
+                })?;
+                features.push(feature);
+            }
+            PreviewFeatureSet::new(features)
+        } else {
+            PreviewFeatureSet::default()
+        };
+
         let proxy_protocol = parsed
             .get("proxy_protocol")
             .and_then(|v| v.as_bool())
@@ -2244,6 +2463,8 @@ impl Config {
             compression_enabled,
             circuit_breaker,
             cache,
+            reliability,
+            preview_features,
             proxy_protocol,
             plugins,
             providers,
@@ -2287,6 +2508,12 @@ mod tests {
             compression_enabled: true,
             circuit_breaker: None,
             cache: None,
+            reliability: ReliabilityConfig {
+                max_inflight_requests: None,
+                brownout_inflight_requests: None,
+                retry_budget_per_request: 2,
+            },
+            preview_features: PreviewFeatureSet::default(),
             proxy_protocol: false,
             plugins: Vec::new(),
             providers: Vec::new(),
@@ -2563,6 +2790,48 @@ protocol = "gemini_embed_content"
         assert!(capabilities.names().contains(&"images_generations"));
         assert!(capabilities.names().contains(&"audio_translation"));
         assert!(capabilities.names().contains(&"embeddings"));
+    }
+
+    #[test]
+    fn preview_features_parsed() {
+        let config = Config::parse(
+            r#"
+port = 8080
+preview_features = ["responses_composed_streaming", "control_plane_import"]
+
+[paths]
+"/*" = ["http://127.0.0.1:3000"]
+"#,
+        )
+        .unwrap();
+
+        assert!(config
+            .preview_features
+            .contains(PreviewFeature::ResponsesComposedStreaming));
+        assert!(config
+            .preview_features
+            .contains(PreviewFeature::ControlPlaneImport));
+        assert!(!config
+            .preview_features
+            .contains(PreviewFeature::ProviderSurfaceTranslations));
+    }
+
+    #[test]
+    fn unknown_preview_feature_rejected() {
+        let error = Config::parse(
+            r#"
+port = 8080
+preview_features = ["totally_unknown"]
+
+[paths]
+"/*" = ["http://127.0.0.1:3000"]
+"#,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+
+        assert!(error.contains("preview_features[0] has unknown feature"));
     }
 
     #[test]

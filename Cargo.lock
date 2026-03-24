@@ -2127,6 +2127,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "serde",
+ "serde_json",
  "sha2",
  "siphasher",
  "socket2 0.5.8",

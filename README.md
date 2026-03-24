@@ -25,12 +25,16 @@ The project is a Cargo workspace with three crates:
 - PROXY protocol support
 - Built-in web dashboard with live metrics
 - LLM gateway plugin with per-key cost tracking, budgets, and provider failover
+- Local process probes on `/_trp/livez` and `/_trp/readyz`
+- Built-in admission control and brownout thresholds for pre-deployment hardening
 
 ## Docs
 
 - [Management API](/Users/krystian/code/tiny-reverse-proxy-rust/docs/management-api.md)
 - [Deployment Guide](/Users/krystian/code/tiny-reverse-proxy-rust/docs/deployment.md)
+- [Reliability Program](/Users/krystian/code/tiny-reverse-proxy-rust/docs/reliability/README.md)
 - [Semantic Safety V0](/Users/krystian/code/tiny-reverse-proxy-rust/docs/semantic-safety-v0.md)
+- [Project Policies](/Users/krystian/code/tiny-reverse-proxy-rust/docs/policies/README.md)
 
 ## Getting Started
 
@@ -116,10 +120,13 @@ cargo test -p tiny-reverse-proxy --features plugin-llm-gateway gateway_virtual_k
 ### Releases
 
 Versions should be cut through the GitHub Actions `Release` workflow, not by
-creating tags manually. That workflow runs the live gateway `/v1/responses`
-smoke as a required gate before it creates the version tag and GitHub release.
-Configure the `release-live-openai` environment with the OpenAI secrets and
-required reviewers so the live smoke stays protected and explicit.
+creating tags manually. Releases are cut from `release/<major>.<minor>`
+branches, using prerelease versions like `1.4.0-rc.1` for RCs and a final
+version from the same branch after soak. The workflow runs the live gateway
+`/v1/responses` smoke and a deterministic release-validation suite before it
+creates the version tag and GitHub release. Configure the
+`release-live-openai` environment with the OpenAI secrets and required
+reviewers so the live smoke stays protected and explicit.
 
 ### Python Realtime Smoke Test
 

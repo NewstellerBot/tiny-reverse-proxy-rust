@@ -17,12 +17,13 @@ use tokio::net::TcpListener;
 
 use proxy_core::cache::ResponseCache;
 use proxy_core::circuit_breaker::CircuitBreaker;
-use proxy_core::config::{LbStrategy, RouteConfig};
+use proxy_core::config::{LbStrategy, ReliabilityConfig, RouteConfig};
 use proxy_core::handlers::proxy::{build_client, ProxyService};
 use proxy_core::metrics::Metrics;
 use proxy_core::plugin::PluginChain;
 use proxy_core::rate_limit::RateLimiter;
 use proxy_core::router::PathResolution;
+use proxy_core::runtime::ProbeState;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -155,7 +156,11 @@ pub struct TestProxyConfig {
     pub cache: Option<ResponseCache>,
     pub compression_enabled: bool,
     pub max_request_body_bytes: u64,
+    pub upstream_timeout_secs: u64,
     pub plugins: Option<Arc<PluginChain>>,
+    pub reliability: ReliabilityConfig,
+    pub inflight_requests: Option<Arc<AtomicUsize>>,
+    pub probe_state: Option<ProbeState>,
 }
 
 impl Default for TestProxyConfig {
@@ -167,7 +172,15 @@ impl Default for TestProxyConfig {
             cache: None,
             compression_enabled: true,
             max_request_body_bytes: 10 * 1024 * 1024,
+            upstream_timeout_secs: 600,
             plugins: None,
+            reliability: ReliabilityConfig {
+                max_inflight_requests: None,
+                brownout_inflight_requests: None,
+                retry_budget_per_request: 2,
+            },
+            inflight_requests: None,
+            probe_state: None,
         }
     }
 }
@@ -182,6 +195,11 @@ pub async fn start_proxy_with_config(
 
     let client = build_client();
     let counter = Arc::new(AtomicUsize::new(0));
+    let inflight_requests = config
+        .inflight_requests
+        .clone()
+        .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
+    let probe_state = config.probe_state.clone().unwrap_or_default();
 
     tokio::spawn(async move {
         loop {
@@ -193,7 +211,11 @@ pub async fn start_proxy_with_config(
             let mut svc =
                 ProxyService::new(Arc::clone(&router), client.clone(), Arc::clone(&counter))
                     .with_peer_addr(peer_addr)
+                    .with_admission_counter(Arc::clone(&inflight_requests))
+                    .with_probe_state(probe_state.clone())
+                    .with_reliability_config(&config.reliability)
                     .with_compression(config.compression_enabled)
+                    .with_upstream_timeout(config.upstream_timeout_secs)
                     .with_max_request_body(config.max_request_body_bytes);
 
             if let Some(ref rl) = config.rate_limiter {

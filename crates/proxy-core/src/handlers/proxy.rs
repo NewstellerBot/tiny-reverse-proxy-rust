@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,14 +26,18 @@ use tracing::Instrument;
 use crate::cache::ResponseCache;
 use crate::circuit_breaker::CircuitBreaker;
 use crate::compression;
-use crate::config::RouteConfig;
+use crate::config::{ReliabilityConfig, RouteConfig};
 use crate::health::HealthState;
 use crate::load_balancer;
 use crate::metrics::Metrics;
 use crate::middleware;
-use crate::plugin::{Action, PluginChain, ProxyError, RequestContext, ResponseContext};
+use crate::plugin::{
+    Action, BrownoutMode, PluginChain, ProviderCandidate, ProviderCandidates, ProxyError,
+    RequestContext, RequestRetryBudget, ResponseContext,
+};
 use crate::rate_limit::RateLimiter;
 use crate::router::RouteResolver;
+use crate::runtime::ProbeState;
 
 /// Headers that must be stripped per RFC 9110 §7.6.1.
 const HOP_BY_HOP_HEADERS: &[&str] = &[
@@ -160,6 +164,68 @@ fn is_retryable_status(status: StatusCode) -> bool {
 /// Returns `true` for provider response codes that should trigger same-request failover.
 fn is_provider_retryable_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryMetricMode {
+    Core,
+    Provider,
+}
+
+impl RetryMetricMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Provider => "provider",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryMetricReason {
+    Timeout,
+    ConnectionError,
+    Status429,
+    Status5xx,
+    MalformedUpstream,
+    NonRetryable,
+}
+
+impl RetryMetricReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::ConnectionError => "connection_error",
+            Self::Status429 => "429",
+            Self::Status5xx => "5xx",
+            Self::MalformedUpstream => "malformed_upstream",
+            Self::NonRetryable => "non_retryable",
+        }
+    }
+}
+
+fn retry_metric_mode(has_provider_routing: bool) -> RetryMetricMode {
+    if has_provider_routing {
+        RetryMetricMode::Provider
+    } else {
+        RetryMetricMode::Core
+    }
+}
+
+fn retry_metric_reason_for_status(
+    status: StatusCode,
+    has_provider_routing: bool,
+) -> RetryMetricReason {
+    if has_provider_routing && status == StatusCode::TOO_MANY_REQUESTS {
+        RetryMetricReason::Status429
+    } else if status.is_server_error()
+        || status == StatusCode::BAD_GATEWAY
+        || status == StatusCode::SERVICE_UNAVAILABLE
+    {
+        RetryMetricReason::Status5xx
+    } else {
+        RetryMetricReason::NonRetryable
+    }
 }
 
 fn status_error(status: StatusCode, has_provider_routing: bool) -> Option<ProxyError> {
@@ -336,6 +402,45 @@ fn route_lb_cache_key(route: &RouteConfig) -> String {
     key
 }
 
+struct InFlightRequestGuard {
+    counter: Arc<AtomicUsize>,
+    metrics: Option<Metrics>,
+    brownout_threshold: Option<usize>,
+}
+
+impl Drop for InFlightRequestGuard {
+    fn drop(&mut self) {
+        let previous = self.counter.fetch_sub(1, Ordering::SeqCst);
+        if let (Some(metrics), Some(threshold)) = (&self.metrics, self.brownout_threshold) {
+            let remaining = previous.saturating_sub(1);
+            if previous >= threshold && remaining < threshold {
+                metrics.set_brownout_active(false);
+            }
+        }
+    }
+}
+
+fn probe_response(
+    status: StatusCode,
+    state: &str,
+    reason: Option<&str>,
+) -> Response<BoxBody<Bytes, hyper::Error>> {
+    let body = serde_json::json!({
+        "status": state,
+        "reason": reason,
+    })
+    .to_string();
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(
+            Full::new(Bytes::from(body))
+                .map_err(|never| match never {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
 #[derive(Debug)]
 enum CollectBodyError {
     TooLarge,
@@ -403,6 +508,11 @@ pub struct ProxyService<R: RouteResolver> {
     max_request_body_bytes: u64,
     upstream_timeout: Duration,
     h3_port: Option<u16>,
+    inflight_requests: Option<Arc<AtomicUsize>>,
+    max_inflight_requests: Option<usize>,
+    brownout_inflight_requests: Option<usize>,
+    retry_budget_per_request: usize,
+    probe_state: Option<ProbeState>,
     plugins: Option<Arc<PluginChain>>,
     connection_extensions: Arc<Extensions>,
     load_balancers: Arc<DashMap<String, Arc<dyn load_balancer::LoadBalancer>>>,
@@ -425,6 +535,11 @@ impl<R: RouteResolver> Clone for ProxyService<R> {
             max_request_body_bytes: self.max_request_body_bytes,
             upstream_timeout: self.upstream_timeout,
             h3_port: self.h3_port,
+            inflight_requests: self.inflight_requests.clone(),
+            max_inflight_requests: self.max_inflight_requests,
+            brownout_inflight_requests: self.brownout_inflight_requests,
+            retry_budget_per_request: self.retry_budget_per_request,
+            probe_state: self.probe_state.clone(),
             plugins: self.plugins.clone(),
             connection_extensions: Arc::clone(&self.connection_extensions),
             load_balancers: Arc::clone(&self.load_balancers),
@@ -449,6 +564,11 @@ impl<R: RouteResolver> ProxyService<R> {
             max_request_body_bytes: 10 * 1024 * 1024,
             upstream_timeout: Duration::from_secs(600),
             h3_port: None,
+            inflight_requests: None,
+            max_inflight_requests: None,
+            brownout_inflight_requests: None,
+            retry_budget_per_request: 2,
+            probe_state: None,
             plugins: None,
             connection_extensions: Arc::new(Extensions::new()),
             load_balancers: Arc::new(DashMap::new()),
@@ -510,6 +630,25 @@ impl<R: RouteResolver> ProxyService<R> {
         self
     }
 
+    pub fn with_probe_state(mut self, probe_state: ProbeState) -> Self {
+        self.probe_state = Some(probe_state);
+        self
+    }
+
+    pub fn with_admission_counter(mut self, inflight_requests: Arc<AtomicUsize>) -> Self {
+        self.inflight_requests = Some(inflight_requests);
+        self
+    }
+
+    pub fn with_reliability_config(mut self, config: &ReliabilityConfig) -> Self {
+        self.max_inflight_requests = config.max_inflight_requests.map(|value| value as usize);
+        self.brownout_inflight_requests = config
+            .brownout_inflight_requests
+            .map(|value| value as usize);
+        self.retry_budget_per_request = config.retry_budget_per_request as usize;
+        self
+    }
+
     pub fn with_plugins(mut self, plugins: Arc<PluginChain>) -> Self {
         self.plugins = Some(plugins);
         self
@@ -544,6 +683,30 @@ impl<R: RouteResolver> ProxyService<R> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
 
+        if method == Method::GET && path == "/_trp/livez" {
+            return Ok(probe_response(StatusCode::OK, "live", None));
+        }
+        if method == Method::GET && path == "/_trp/readyz" {
+            let snapshot = self
+                .probe_state
+                .as_ref()
+                .map(ProbeState::snapshot)
+                .unwrap_or_else(|| ProbeState::new().snapshot());
+            let status = if snapshot.ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            let state = if snapshot.ready {
+                "ready"
+            } else if snapshot.draining {
+                "draining"
+            } else {
+                "starting"
+            };
+            return Ok(probe_response(status, state, snapshot.reason.as_deref()));
+        }
+
         // Create a tracing span for this request.  When the `opentelemetry`
         // feature is active and a subscriber is configured, this becomes a
         // real OTEL span.  Otherwise it compiles to a no-op.
@@ -575,6 +738,56 @@ impl<R: RouteResolver> ProxyService<R> {
             .unwrap_or_else(|| path.clone());
         let version = req.version();
         let accept_encoding = req.headers().get("accept-encoding").cloned();
+
+        let (_inflight_guard, inflight_now) = match self.inflight_requests.as_ref() {
+            Some(counter) => {
+                let previous = counter.fetch_add(1, Ordering::SeqCst);
+                let current = previous + 1;
+                if let (Some(metrics), Some(limit)) =
+                    (&self.metrics, self.brownout_inflight_requests)
+                {
+                    if current >= limit {
+                        metrics.set_brownout_active(true);
+                        if previous < limit {
+                            metrics.record_brownout_activation();
+                        }
+                    }
+                }
+                (
+                    Some(InFlightRequestGuard {
+                        counter: Arc::clone(counter),
+                        metrics: self.metrics.clone(),
+                        brownout_threshold: self.brownout_inflight_requests,
+                    }),
+                    Some(current),
+                )
+            }
+            None => (None, None),
+        };
+
+        if let (Some(current), Some(limit)) = (inflight_now, self.max_inflight_requests) {
+            if current > limit {
+                if let Some(ref metrics) = self.metrics {
+                    metrics.record_admission_rejection();
+                }
+                self.record_metrics(&method, "503", start);
+                return Ok(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "503 Service Unavailable\n",
+                ));
+            }
+        }
+
+        if let Some(ref limiter) = self.rate_limiter {
+            if let Some(resp) = middleware::check_rate_limit(
+                limiter,
+                self.peer_addr,
+                self.metrics.as_ref(),
+                &method,
+            ) {
+                return Ok(resp);
+            }
+        }
 
         // Body size check (before buffering/plugin hooks).
         if let Some(resp) = middleware::check_body_limit(req.headers(), self.max_request_body_bytes)
@@ -630,6 +843,19 @@ impl<R: RouteResolver> ProxyService<R> {
             connection: Arc::clone(&self.connection_extensions),
             extensions: Extensions::new(),
         };
+        plugin_ctx
+            .extensions
+            .insert(RequestRetryBudget::new(self.retry_budget_per_request));
+        if let (Some(current), Some(limit)) = (inflight_now, self.brownout_inflight_requests) {
+            if current >= limit {
+                plugin_ctx.extensions.insert(BrownoutMode {
+                    disable_prompt_cache: true,
+                    disable_semantic_cache: true,
+                    disable_semantic_safety: true,
+                    disable_managed_tools: true,
+                });
+            }
+        }
 
         // Store the span in extensions so plugins can enrich it.
         #[cfg(feature = "opentelemetry")]
@@ -659,18 +885,6 @@ impl<R: RouteResolver> ProxyService<R> {
             "llm.upstream_timeout_ms",
             effective_timeout.as_millis() as u64,
         );
-
-        // Rate limiting.
-        if let Some(ref limiter) = self.rate_limiter {
-            if let Some(resp) = middleware::check_rate_limit(
-                limiter,
-                self.peer_addr,
-                self.metrics.as_ref(),
-                &method,
-            ) {
-                return Ok(resp);
-            }
-        }
 
         // Route lookup.
         let route_config = match self.router.resolve_route_config(&path) {
@@ -717,28 +931,6 @@ impl<R: RouteResolver> ProxyService<R> {
             }
         }
 
-        // Check for ProviderCandidates (cross-provider retry from LLM gateway).
-        let provider_candidates = plugin_ctx
-            .extensions
-            .remove::<crate::plugin::ProviderCandidates>();
-        let use_provider_candidates = provider_candidates
-            .as_ref()
-            .is_some_and(|pc| !pc.0.is_empty());
-
-        let selected_upstream = plugin_ctx.selected_upstream.clone();
-        let selected_servers: Vec<String> = match selected_upstream {
-            Some(forced_upstream) => vec![forced_upstream],
-            None => healthy_servers.iter().map(|s| (*s).clone()).collect(),
-        };
-
-        if selected_servers.is_empty() && !use_provider_candidates {
-            self.record_metrics(&method, "503", start);
-            return Ok(error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "503 Service Unavailable\n",
-            ));
-        }
-
         // Load balancer + upstream selection.
         let lb = {
             let key = route_lb_cache_key(&route_config);
@@ -750,20 +942,77 @@ impl<R: RouteResolver> ProxyService<R> {
             });
             Arc::clone(entry.value())
         };
-        let server_refs: Vec<&String> = selected_servers.iter().collect();
-        let start_idx = {
-            use crate::config::LbStrategy;
-            use std::sync::atomic::Ordering;
-            match route_config.lb {
-                LbStrategy::RoundRobin => {
-                    self.counter.fetch_add(1, Ordering::Relaxed) % server_refs.len()
-                }
-                _ => {
-                    let lb_key = self.peer_addr.map(|a| a.ip().to_string());
-                    lb.pick(&server_refs, lb_key.as_deref())
+
+        enum UpstreamSelection {
+            ProviderCandidates(Vec<ProviderCandidate>),
+            RouteServers {
+                servers: Vec<String>,
+                start_idx: usize,
+            },
+        }
+
+        let provider_candidates = plugin_ctx.extensions.remove::<ProviderCandidates>();
+        let route_servers: Vec<String> = match plugin_ctx.selected_upstream.clone() {
+            Some(forced_upstream) => vec![forced_upstream],
+            None => healthy_servers.iter().map(|s| (*s).clone()).collect(),
+        };
+
+        let selection = if let Some(provider_candidates) = provider_candidates {
+            if !provider_candidates.0.is_empty() {
+                UpstreamSelection::ProviderCandidates(provider_candidates.0)
+            } else if route_servers.is_empty() {
+                self.record_metrics(&method, "503", start);
+                return Ok(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "503 Service Unavailable\n",
+                ));
+            } else {
+                let server_refs: Vec<&String> = route_servers.iter().collect();
+                let start_idx = {
+                    use crate::config::LbStrategy;
+                    use std::sync::atomic::Ordering;
+                    match route_config.lb {
+                        LbStrategy::RoundRobin => {
+                            self.counter.fetch_add(1, Ordering::Relaxed) % server_refs.len()
+                        }
+                        _ => {
+                            let lb_key = self.peer_addr.map(|a| a.ip().to_string());
+                            lb.pick(&server_refs, lb_key.as_deref())
+                        }
+                    }
+                };
+                UpstreamSelection::RouteServers {
+                    servers: route_servers,
+                    start_idx,
                 }
             }
+        } else if route_servers.is_empty() {
+            self.record_metrics(&method, "503", start);
+            return Ok(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "503 Service Unavailable\n",
+            ));
+        } else {
+            let server_refs: Vec<&String> = route_servers.iter().collect();
+            let start_idx = {
+                use crate::config::LbStrategy;
+                use std::sync::atomic::Ordering;
+                match route_config.lb {
+                    LbStrategy::RoundRobin => {
+                        self.counter.fetch_add(1, Ordering::Relaxed) % server_refs.len()
+                    }
+                    _ => {
+                        let lb_key = self.peer_addr.map(|a| a.ip().to_string());
+                        lb.pick(&server_refs, lb_key.as_deref())
+                    }
+                }
+            };
+            UpstreamSelection::RouteServers {
+                servers: route_servers,
+                start_idx,
+            }
         };
+        let use_provider_candidates = matches!(selection, UpstreamSelection::ProviderCandidates(_));
 
         let (mut parts, body) = req.into_parts();
 
@@ -805,15 +1054,17 @@ impl<R: RouteResolver> ProxyService<R> {
             .map(|pq| pq.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
 
-        let max_attempts = if use_provider_candidates {
-            provider_candidates.as_ref().unwrap().0.len()
-        } else if is_idempotent(&method) && selected_servers.len() > 1 {
-            3.min(selected_servers.len())
-        } else {
-            1
+        let natural_max_attempts = match &selection {
+            UpstreamSelection::ProviderCandidates(candidates) => candidates.len(),
+            UpstreamSelection::RouteServers { servers, .. }
+                if is_idempotent(&method) && servers.len() > 1 =>
+            {
+                3.min(servers.len())
+            }
+            UpstreamSelection::RouteServers { .. } => 1,
         };
 
-        if use_provider_candidates || max_attempts > 1 {
+        if use_provider_candidates || natural_max_attempts > 1 {
             let buffered_body =
                 match collect_body_with_limit(body, self.max_request_body_bytes).await {
                     Ok(collected) => collected,
@@ -831,17 +1082,38 @@ impl<R: RouteResolver> ProxyService<R> {
                     }
                 };
 
+            let retry_mode = retry_metric_mode(use_provider_candidates);
             let mut last_error_response = None;
+            let mut last_retry_reason = None;
 
-            for attempt in 0..max_attempts {
+            for attempt in 0..natural_max_attempts {
+                if attempt > 0
+                    && !plugin_ctx
+                        .extensions
+                        .get::<RequestRetryBudget>()
+                        .map(|budget| budget.try_consume_attempt())
+                        .unwrap_or(false)
+                {
+                    if let Some(reason) = last_retry_reason {
+                        self.record_retry_exhaustion(retry_mode, reason);
+                    }
+                    break;
+                }
+                if attempt > 0 {
+                    if let Some(reason) = last_retry_reason {
+                        self.record_retry_attempt(retry_mode, reason);
+                    }
+                }
                 // Resolve upstream and headers from provider candidates or selected_servers.
-                let (upstream_str, mut headers) = if use_provider_candidates {
-                    let candidates = &provider_candidates.as_ref().unwrap().0;
-                    let candidate = &candidates[attempt];
-                    (candidate.upstream.clone(), candidate.headers.clone())
-                } else {
-                    let idx = (start_idx + attempt) % selected_servers.len();
-                    (selected_servers[idx].clone(), parts.headers.clone())
+                let (upstream_str, mut headers) = match &selection {
+                    UpstreamSelection::ProviderCandidates(candidates) => {
+                        let candidate = &candidates[attempt];
+                        (candidate.upstream.clone(), candidate.headers.clone())
+                    }
+                    UpstreamSelection::RouteServers { servers, start_idx } => {
+                        let idx = (start_idx + attempt) % servers.len();
+                        (servers[idx].clone(), parts.headers.clone())
+                    }
                 };
                 let upstream = &upstream_str;
                 plugin_ctx.selected_upstream = Some(upstream.clone());
@@ -851,6 +1123,10 @@ impl<R: RouteResolver> ProxyService<R> {
                     Ok(v) => v,
                     Err(_) => {
                         tracing::error!(upstream = %upstream, "malformed upstream host header");
+                        self.record_retry_exhaustion(
+                            retry_mode,
+                            RetryMetricReason::MalformedUpstream,
+                        );
                         self.record_metrics(&method, "502", start);
                         return Ok(error_response(StatusCode::BAD_GATEWAY, "502 Bad Gateway\n"));
                     }
@@ -869,6 +1145,10 @@ impl<R: RouteResolver> ProxyService<R> {
                     Ok(req) => req,
                     Err(e) => {
                         tracing::error!(upstream = %upstream, error = %e, "failed to build upstream request");
+                        self.record_retry_exhaustion(
+                            retry_mode,
+                            RetryMetricReason::MalformedUpstream,
+                        );
                         self.record_metrics(&method, "502", start);
                         return Ok(error_response(StatusCode::BAD_GATEWAY, "502 Bad Gateway\n"));
                     }
@@ -909,12 +1189,15 @@ impl<R: RouteResolver> ProxyService<R> {
                         } else {
                             is_retryable_status(status)
                         };
-                        if should_retry && attempt + 1 < max_attempts {
+                        let retry_reason =
+                            retry_metric_reason_for_status(status, use_provider_candidates);
+                        if should_retry && attempt + 1 < natural_max_attempts {
                             if status_error.is_some() {
                                 if let Some(ref cb) = self.circuit_breaker {
                                     cb.record_failure(upstream);
                                 }
                             }
+                            last_retry_reason = Some(retry_reason);
                             tracing::warn!(
                                 method = %method, path = %path, upstream = %upstream,
                                 status = status.as_u16(), attempt = attempt + 1,
@@ -922,6 +1205,20 @@ impl<R: RouteResolver> ProxyService<R> {
                             );
                             last_error_response = Some(resp);
                             continue;
+                        }
+
+                        if should_retry {
+                            self.record_retry_exhaustion(retry_mode, retry_reason);
+                        } else if use_provider_candidates && !status.is_success() {
+                            self.record_retry_exhaustion(
+                                retry_mode,
+                                RetryMetricReason::NonRetryable,
+                            );
+                        } else if status_error.is_some() {
+                            self.record_retry_exhaustion(
+                                retry_mode,
+                                RetryMetricReason::NonRetryable,
+                            );
                         }
 
                         if status.is_success() {
@@ -1003,11 +1300,16 @@ impl<R: RouteResolver> ProxyService<R> {
                                 return Ok(resp);
                             }
                         }
-                        if attempt + 1 < max_attempts {
+                        if attempt + 1 < natural_max_attempts {
+                            last_retry_reason = Some(RetryMetricReason::ConnectionError);
                             tracing::warn!(method = %method, path = %path, upstream = %upstream, error = %e, attempt = attempt + 1, "retrying request on next upstream");
                             continue;
                         }
                         tracing::warn!(method = %method, path = %path, upstream = %upstream, error = %e, "upstream error");
+                        self.record_retry_exhaustion(
+                            retry_mode,
+                            RetryMetricReason::ConnectionError,
+                        );
                         self.record_metrics(&method, "502", start);
                         return Ok(error_response(StatusCode::BAD_GATEWAY, "502 Bad Gateway\n"));
                     }
@@ -1021,11 +1323,13 @@ impl<R: RouteResolver> ProxyService<R> {
                                 return Ok(resp);
                             }
                         }
-                        if use_provider_candidates && attempt + 1 < max_attempts {
+                        if use_provider_candidates && attempt + 1 < natural_max_attempts {
+                            last_retry_reason = Some(RetryMetricReason::Timeout);
                             tracing::warn!(method = %method, path = %path, upstream = %upstream, attempt = attempt + 1, "upstream timeout, retrying on next provider");
                             continue;
                         }
                         tracing::warn!(method = %method, path = %path, upstream = %upstream, "upstream timeout");
+                        self.record_retry_exhaustion(retry_mode, RetryMetricReason::Timeout);
                         self.record_metrics(&method, "504", start);
                         return Ok(error_response(
                             StatusCode::GATEWAY_TIMEOUT,
@@ -1049,33 +1353,44 @@ impl<R: RouteResolver> ProxyService<R> {
             Ok(error_response(StatusCode::BAD_GATEWAY, "502 Bad Gateway\n"))
         } else {
             // Single attempt with streaming body.
-            let upstream = &selected_servers[start_idx];
+            let (upstream, request_headers) = match &selection {
+                UpstreamSelection::ProviderCandidates(candidates) => {
+                    let candidate = &candidates[0];
+                    (candidate.upstream.clone(), candidate.headers.clone())
+                }
+                UpstreamSelection::RouteServers { servers, start_idx } => {
+                    (servers[*start_idx].clone(), parts.headers.clone())
+                }
+            };
+            let retry_mode = retry_metric_mode(use_provider_candidates);
             plugin_ctx.selected_upstream = Some(upstream.clone());
-            let uri = upstream_uri(upstream, &path_and_query);
+            let uri = upstream_uri(&upstream, &path_and_query);
 
-            let host_value: HeaderValue = match upstream_host(upstream).parse() {
+            let host_value: HeaderValue = match upstream_host(&upstream).parse() {
                 Ok(v) => v,
                 Err(_) => {
                     tracing::error!(upstream = %upstream, "malformed upstream host header");
+                    self.record_retry_exhaustion(retry_mode, RetryMetricReason::MalformedUpstream);
                     self.record_metrics(&method, "502", start);
                     return Ok(error_response(StatusCode::BAD_GATEWAY, "502 Bad Gateway\n"));
                 }
             };
             let mut upstream_req = Request::builder().method(parts.method).uri(&uri);
             if let Some(headers) = upstream_req.headers_mut() {
-                *headers = parts.headers.clone();
+                *headers = request_headers;
                 headers.insert(HOST, host_value);
             }
             let upstream_req = match upstream_req.body(body) {
                 Ok(req) => req,
                 Err(e) => {
                     tracing::error!(upstream = %upstream, error = %e, "failed to build upstream request");
+                    self.record_retry_exhaustion(retry_mode, RetryMetricReason::MalformedUpstream);
                     self.record_metrics(&method, "502", start);
                     return Ok(error_response(StatusCode::BAD_GATEWAY, "502 Bad Gateway\n"));
                 }
             };
 
-            lb.on_request_start(upstream);
+            lb.on_request_start(&upstream);
             let attempt_span = tracing::info_span!(
                 "upstream_turn",
                 http.method = %method,
@@ -1090,7 +1405,7 @@ impl<R: RouteResolver> ProxyService<R> {
                 self.client.request(upstream_req).instrument(attempt_span),
             )
             .await;
-            lb.on_request_end(upstream);
+            lb.on_request_end(&upstream);
 
             match result {
                 Ok(Ok(resp)) => {
@@ -1107,12 +1422,18 @@ impl<R: RouteResolver> ProxyService<R> {
                     }
                     if status.is_success() {
                         if let Some(ref cb) = self.circuit_breaker {
-                            cb.record_success(upstream);
+                            cb.record_success(&upstream);
                         }
                     } else if status_error.is_some() {
+                        self.record_retry_exhaustion(
+                            retry_mode,
+                            retry_metric_reason_for_status(status, use_provider_candidates),
+                        );
                         if let Some(ref cb) = self.circuit_breaker {
-                            cb.record_failure(upstream);
+                            cb.record_failure(&upstream);
                         }
+                    } else if use_provider_candidates && !status.is_success() {
+                        self.record_retry_exhaustion(retry_mode, RetryMetricReason::NonRetryable);
                     }
 
                     let mut resp = self
@@ -1172,7 +1493,7 @@ impl<R: RouteResolver> ProxyService<R> {
                 }
                 Ok(Err(e)) => {
                     if let Some(ref cb) = self.circuit_breaker {
-                        cb.record_failure(upstream);
+                        cb.record_failure(&upstream);
                     }
                     // Plugin: on_error hook.
                     if let Some(ref plugins) = self.plugins {
@@ -1184,6 +1505,7 @@ impl<R: RouteResolver> ProxyService<R> {
                         }
                     }
                     tracing::warn!(method = %method, path = %path, upstream = %upstream, error = %e, "upstream error");
+                    self.record_retry_exhaustion(retry_mode, RetryMetricReason::ConnectionError);
                     self.record_metrics(&method, "502", start);
                     Ok(error_response(StatusCode::BAD_GATEWAY, "502 Bad Gateway\n"))
                 }
@@ -1198,6 +1520,7 @@ impl<R: RouteResolver> ProxyService<R> {
                         }
                     }
                     tracing::warn!(method = %method, path = %path, upstream = %upstream, "upstream timeout");
+                    self.record_retry_exhaustion(retry_mode, RetryMetricReason::Timeout);
                     self.record_metrics(&method, "504", start);
                     Ok(error_response(
                         StatusCode::GATEWAY_TIMEOUT,
@@ -1281,6 +1604,18 @@ impl<R: RouteResolver> ProxyService<R> {
     fn record_metrics(&self, method: &Method, status: &str, start: std::time::Instant) {
         if let Some(ref m) = self.metrics {
             crate::middleware::record_metrics(m, method, status, start);
+        }
+    }
+
+    fn record_retry_attempt(&self, mode: RetryMetricMode, reason: RetryMetricReason) {
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_retry_attempt(mode.as_str(), reason.as_str());
+        }
+    }
+
+    fn record_retry_exhaustion(&self, mode: RetryMetricMode, reason: RetryMetricReason) {
+        if let Some(ref metrics) = self.metrics {
+            metrics.record_retry_exhaustion(mode.as_str(), reason.as_str());
         }
     }
 
@@ -1591,8 +1926,9 @@ fn error_response(status: StatusCode, msg: &'static str) -> Response<BoxBody<Byt
 mod tests {
     use super::*;
     use crate::circuit_breaker::CircuitState;
-    use crate::config::{LbStrategy, RouteConfig};
+    use crate::config::{LbStrategy, ReliabilityConfig, RouteConfig};
     use crate::router::PathResolution;
+    use crate::runtime::ProbeState;
     use crate::tls;
     use hyper::body::Incoming;
     use hyper::service::service_fn;
@@ -2258,6 +2594,125 @@ mod tests {
             CircuitState::Open,
             "cache hits must not consume or strand half-open probes"
         );
+    }
+
+    #[tokio::test]
+    async fn probe_endpoints_reflect_process_state() {
+        let router = Arc::new(CatchAllRouter {
+            route_config: RouteConfig {
+                servers: vec!["127.0.0.1:65534".to_string()],
+                lb: LbStrategy::RoundRobin,
+                weights: None,
+            },
+        });
+        let probe_state = ProbeState::new();
+        let service = ProxyService::new(router, build_client(), Arc::new(AtomicUsize::new(0)))
+            .with_probe_state(probe_state.clone());
+
+        let live = service
+            .clone()
+            .handle_boxed(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/_trp/livez")
+                    .body(
+                        Full::new(Bytes::new())
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(live.status(), StatusCode::OK);
+
+        let starting = service
+            .clone()
+            .handle_boxed(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/_trp/readyz")
+                    .body(
+                        Full::new(Bytes::new())
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(starting.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        probe_state.mark_ready();
+        let ready = service
+            .clone()
+            .handle_boxed(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/_trp/readyz")
+                    .body(
+                        Full::new(Bytes::new())
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+
+        probe_state.mark_draining("test drain");
+        let draining = service
+            .handle_boxed(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/_trp/readyz")
+                    .body(
+                        Full::new(Bytes::new())
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(draining.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn admission_control_rejects_when_inflight_limit_is_exceeded() {
+        let router = Arc::new(CatchAllRouter {
+            route_config: RouteConfig {
+                servers: vec!["127.0.0.1:65534".to_string()],
+                lb: LbStrategy::RoundRobin,
+                weights: None,
+            },
+        });
+        let inflight = Arc::new(AtomicUsize::new(1));
+        let service = ProxyService::new(router, build_client(), Arc::new(AtomicUsize::new(0)))
+            .with_admission_counter(Arc::clone(&inflight))
+            .with_reliability_config(&ReliabilityConfig {
+                max_inflight_requests: Some(1),
+                brownout_inflight_requests: None,
+                retry_budget_per_request: 2,
+            });
+
+        let response = service
+            .handle_boxed(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/test")
+                    .body(
+                        Full::new(Bytes::new())
+                            .map_err(|never| match never {})
+                            .boxed(),
+                    )
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
 

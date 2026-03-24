@@ -11,10 +11,13 @@ use hyper::body::Incoming;
 use hyper::header::{HeaderValue, CONTENT_LENGTH, CONTENT_TYPE, HOST};
 use hyper::{Method, Request, Response, StatusCode};
 use proxy_core::config::{
-    ManagedToolRequestShape, ProviderKeyConfig, ProviderRuntimeSemantics, ProviderSurfaceCatalog,
+    ManagedToolRequestShape, PreviewFeature, PreviewFeatureSet, PreviewFeatureStatus,
+    ProviderKeyConfig, ProviderRuntimeSemantics, ProviderSurfaceCatalog,
 };
 use proxy_core::handlers::proxy::build_client;
-use proxy_core::plugin::{Action, Plugin, ProviderCandidates, RequestContext};
+use proxy_core::plugin::{
+    Action, BrownoutMode, Plugin, ProviderCandidates, RequestContext, RequestRetryBudget,
+};
 use rand::Rng;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -264,6 +267,7 @@ pub struct ToolRuntimeMcpServerSnapshot {
 pub struct ToolRuntimeProviderSnapshot {
     pub name: String,
     pub family: String,
+    pub stability: String,
     pub surfaces: ProviderSurfaceCatalog,
     #[serde(flatten)]
     pub semantics: ProviderRuntimeSemantics,
@@ -288,6 +292,7 @@ pub struct ToolRuntimeStatusSnapshot {
     pub default_timeout_ms: u64,
     pub max_round_trips: usize,
     pub responses_stream_mode: String,
+    pub preview_features: Vec<PreviewFeatureStatus>,
     pub supported_executors: Vec<String>,
     pub web_search_backends: Vec<ToolRuntimeBackendSnapshot>,
     pub mcp_servers: Vec<ToolRuntimeMcpServerSnapshot>,
@@ -310,6 +315,7 @@ pub struct ToolRuntime {
     timeout: Duration,
     max_round_trips: usize,
     responses_stream_mode: ResponsesStreamMode,
+    preview_features: PreviewFeatureSet,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -580,6 +586,7 @@ pub async fn create_plugin(
     config: &toml::Value,
     providers: &[ProviderKeyConfig],
     governance: Arc<GovernanceState>,
+    preview_features: PreviewFeatureSet,
 ) -> Result<ToolRuntime, Box<dyn std::error::Error>> {
     let timeout = config
         .get("tool_timeout_ms")
@@ -599,6 +606,14 @@ pub async fn create_plugin(
             .ok_or_else(|| format!("invalid responses_stream_mode '{value}'"))?,
         None => ResponsesStreamMode::Strict,
     };
+    if responses_stream_mode == ResponsesStreamMode::Composed
+        && !preview_features.contains(PreviewFeature::ResponsesComposedStreaming)
+    {
+        return Err(
+            "tool_runtime.responses_stream_mode = \"composed\" requires preview_features to include \"responses_composed_streaming\""
+                .into(),
+        );
+    }
     let web_search_backends = parse_web_search_backends(config)?;
     let mcp_servers = parse_mcp_servers(config)?;
     let arxiv = ArxivRuntimeConfig {
@@ -629,6 +644,7 @@ pub async fn create_plugin(
         timeout: Duration::from_millis(timeout),
         max_round_trips,
         responses_stream_mode,
+        preview_features,
     };
     runtime.refresh_mcp_inventory().await;
     runtime
@@ -646,6 +662,17 @@ impl Plugin for ToolRuntime {
     async fn on_request(&self, ctx: &mut RequestContext) -> Action {
         if ctx.method != Method::POST {
             return Action::Continue;
+        }
+        if ctx
+            .extensions
+            .get::<BrownoutMode>()
+            .map(|mode| mode.disable_managed_tools)
+            .unwrap_or(false)
+        {
+            return Action::Respond(json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "gateway brownout active: managed tools temporarily disabled",
+            ));
         }
 
         let Some(body) = ctx.body.as_ref() else {
@@ -1035,6 +1062,7 @@ impl ToolRuntime {
             .map(|provider| ToolRuntimeProviderSnapshot {
                 name: provider.name.clone(),
                 family: provider.family_kind().as_str().to_string(),
+                stability: provider.stability().as_str().to_string(),
                 surfaces: provider.surfaces().clone(),
                 semantics: provider.runtime_semantics(),
                 data_collection: provider
@@ -1108,6 +1136,7 @@ impl ToolRuntime {
             default_timeout_ms: self.timeout.as_millis() as u64,
             max_round_trips: self.max_round_trips,
             responses_stream_mode: self.responses_stream_mode.as_str().to_string(),
+            preview_features: self.preview_features.statuses(),
             supported_executors: vec![
                 "webhook".to_string(),
                 "web_search".to_string(),
@@ -6627,6 +6656,14 @@ async fn send_provider_request(
     body_json: &Value,
     timeout: Duration,
 ) -> Result<ProviderResponse, String> {
+    if !ctx
+        .extensions
+        .get::<RequestRetryBudget>()
+        .map(|budget| budget.try_consume_attempt())
+        .unwrap_or(true)
+    {
+        return Err("request retry budget exhausted".to_string());
+    }
     let body = serde_json::to_vec(body_json)
         .map_err(|error| format!("failed to encode follow-up provider request: {error}"))?;
     let uri = join_upstream_uri(

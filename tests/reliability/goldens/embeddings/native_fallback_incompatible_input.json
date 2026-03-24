@@ -1,0 +1,53 @@
+{
+  "scenario_id": "embeddings_native_fallback_incompatible_input",
+  "request": {
+    "method": "POST",
+    "path": "/v1/embeddings",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "model": "text-embedding-3-large",
+      "input": [[1, 2, 3], [4, 5, 6]]
+    }
+  },
+  "provider_context": {
+    "family": "gemini",
+    "surfaced_protocol": "gemini_embed_content",
+    "request_mode": "native_fallback"
+  },
+  "upstream_response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "object": "list",
+      "data": [
+        {
+          "index": 0,
+          "embedding": [0.1, 0.2]
+        },
+        {
+          "index": 1,
+          "embedding": [0.3, 0.4]
+        }
+      ],
+      "model": "text-embedding-3-large"
+    }
+  },
+  "expected_upstream": {
+    "path": "/v1/embeddings",
+    "body_contains": [
+      "\"input\":[[1,2,3],[4,5,6]]",
+      "\"model\":\"text-embedding-3-large\""
+    ]
+  },
+  "expected_client": {
+    "status": 200,
+    "body_contains": [
+      "\"model\":\"text-embedding-3-large\"",
+      "\"embedding\":[0.3,0.4]"
+    ]
+  }
+}

@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a defect in stable or preview behavior.
+title: "[bug] "
+labels:
+  - reliability
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Provide a minimal reproducible example or exact request/config sequence.
+    validations:
+      required: true
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Is this a regression?
+      options:
+        - "No"
+        - "Yes"
+        - "Unsure"
+    validations:
+      required: true
+  - type: dropdown
+    id: provider_specific
+    attributes:
+      label: Is this provider-specific?
+      options:
+        - "No"
+        - "Yes"
+        - "Unsure"
+    validations:
+      required: true
+  - type: dropdown
+    id: release_blocker
+    attributes:
+      label: Could this block a release?
+      options:
+        - "No"
+        - "Yes"
+        - "Unsure"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Platform, store backend, provider family, and version if known.

@@ -477,7 +477,8 @@ mod tests {
     #[tokio::test]
     async fn test_all_providers_failed() {
         // #5: When ALL providers are marked as failed, on_upstream_select should filter
-        // out every server, leaving an empty list (caller is responsible for 502).
+        // out every server, leaving an empty list for the caller to turn into a
+        // normal upstream-unavailable response.
         let failover = make_failover();
         let mut ctx = make_ctx();
 

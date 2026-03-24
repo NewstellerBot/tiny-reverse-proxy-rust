@@ -2510,6 +2510,24 @@ mod tests {
             status_json["responses_stream_mode"].as_str(),
             Some("strict")
         );
+        let preview_features = status_json["preview_features"]
+            .as_array()
+            .expect("preview features array");
+        assert!(preview_features.iter().any(|feature| {
+            feature["name"].as_str() == Some("responses_composed_streaming")
+                && feature["enabled"].as_bool() == Some(false)
+                && feature["enforcement"].as_str() == Some("hard_gate")
+        }));
+        assert!(preview_features.iter().any(|feature| {
+            feature["name"].as_str() == Some("control_plane_import")
+                && feature["enabled"].as_bool() == Some(false)
+                && feature["enforcement"].as_str() == Some("hard_gate")
+        }));
+        assert!(preview_features.iter().any(|feature| {
+            feature["name"].as_str() == Some("provider_surface_translations")
+                && feature["enabled"].as_bool() == Some(false)
+                && feature["enforcement"].as_str() == Some("visibility_only")
+        }));
         assert_eq!(
             status_json["arxiv_base_url"].as_str(),
             Some("https://arxiv.test/api/query")
@@ -2578,6 +2596,7 @@ mod tests {
             .find(|provider| provider["name"].as_str() == Some("openai"))
             .expect("openai runtime provider");
         assert_eq!(openai["family"].as_str(), Some("openai"));
+        assert_eq!(openai["stability"].as_str(), Some("stable"));
         assert_eq!(
             openai["surfaces"]["responses"].as_str(),
             Some("openai_compatible")
@@ -2691,6 +2710,7 @@ mod tests {
             .find(|provider| provider["name"].as_str() == Some("anthropic"))
             .expect("anthropic runtime provider");
         assert_eq!(anthropic["family"].as_str(), Some("anthropic"));
+        assert_eq!(anthropic["stability"].as_str(), Some("preview"));
         assert_eq!(
             anthropic["managed_tool_request_shapes"]
                 .as_array()
@@ -2749,6 +2769,7 @@ mod tests {
             .iter()
             .find(|provider| provider["name"].as_str() == Some("openai"))
             .expect("openai provider");
+        assert_eq!(openai["stability"].as_str(), Some("stable"));
         assert!(openai["managed_tool_request_shapes"]
             .as_array()
             .into_iter()
@@ -2816,6 +2837,7 @@ mod tests {
             .iter()
             .find(|provider| provider["name"].as_str() == Some("anthropic"))
             .expect("anthropic provider");
+        assert_eq!(anthropic["stability"].as_str(), Some("preview"));
         assert_eq!(
             anthropic["managed_tool_request_shapes"][0].as_str(),
             Some("anthropic_messages")

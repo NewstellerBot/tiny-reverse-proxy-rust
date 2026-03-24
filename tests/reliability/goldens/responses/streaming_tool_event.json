@@ -1,0 +1,42 @@
+{
+  "scenario_id": "responses_streaming_tool_event",
+  "request": {
+    "method": "POST",
+    "path": "/v1/responses",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "model": "gpt-4.1-mini",
+      "input": "Call the weather tool",
+      "stream": true
+    }
+  },
+  "provider_context": {
+    "family": "openai",
+    "surfaced_protocol": "responses_openai_compatible",
+    "request_mode": "native_streaming"
+  },
+  "upstream_response": {
+    "status": 200,
+    "headers": {
+      "content-type": "text/event-stream"
+    },
+    "body": "event: response.output_item.added\ndata: {\"type\":\"tool_call\",\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}\n\nevent: response.completed\ndata: {\"id\":\"resp_stream_done\"}\n\n"
+  },
+  "expected_upstream": {
+    "path": "/v1/responses",
+    "body_contains": [
+      "\"stream\":true",
+      "\"Call the weather tool\""
+    ]
+  },
+  "expected_client": {
+    "status": 200,
+    "body_contains": [
+      "response.output_item.added",
+      "\"weather\"",
+      "response.completed"
+    ]
+  }
+}

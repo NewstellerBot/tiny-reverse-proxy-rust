@@ -45,6 +45,11 @@ enabled = true
 [plugins.config]
 tool_timeout_ms = 5000
 max_round_trips = 8
+
+[reliability]
+max_inflight_requests = 2048
+brownout_inflight_requests = 1536
+retry_budget_per_request = 2
 ```
 
 Notes:
@@ -54,6 +59,13 @@ Notes:
   direct provider keys.
 - If `content_filter` and `semantic_safety` are both enabled, `content_filter`
   must come first. Startup now fails on unsafe ordering.
+- `/_trp/livez` and `/_trp/readyz` are reserved local process probes. They are
+  separate from upstream `[health_check]`, which still controls origin health
+  selection.
+- `reliability.max_inflight_requests` is a hard local admission cap.
+  `reliability.brownout_inflight_requests` activates local brownout mode first,
+  which disables optional hot-path features like prompt cache, semantic cache,
+  semantic safety export, and managed tools before hard rejection starts.
 
 ## Production state backends
 
@@ -176,14 +188,51 @@ Recommended production posture:
   semantic-evaluation spans
 - keep routing debug request headers disabled by default and only enable them
   for live debugging
+- scrape the local process probes on the main listener:
+  - `GET /_trp/livez`
+  - `GET /_trp/readyz`
+- keep readiness tied to local process safety only:
+  - startup validation complete
+  - management/metrics listeners successfully bound
+  - not currently draining for shutdown
 
 Relevant visibility surfaces:
 
 - `/metrics`
+- `/_trp/livez`
+- `/_trp/readyz`
 - `/api/v1/providers`
 - `/api/v1/providers/health`
 - `/api/v1/tool-runtime/status`
 - `/api/v1/prompt-cache/status`
+
+## Multi-node baseline
+
+Minimum serious production topology:
+
+- multiple proxy instances behind a load balancer
+- Postgres or MySQL as shared control-plane state
+- `management_api_port` exposed only on an operator network
+- node-local caches treated as advisory only
+- readiness/liveness integrated with rollout and drain behavior
+
+Operational rules:
+
+- do not rely on in-memory cache state for correctness or control-plane truth
+- use `/_trp/readyz` for load balancer readiness, not upstream `[health_check]`
+- treat `SIGHUP` as route-only reload; provider/plugin/runtime changes still
+  require a restart
+- keep release cuts on the Actions `Release` workflow so the deterministic test
+  suite and live gateway smoke both gate version creation
+- isolate the management API from public ingress
+
+Policy references:
+
+- [Support Matrix](/Users/krystian/code/tiny-reverse-proxy-rust/docs/policies/support.md)
+- [Deployment Topology](/Users/krystian/code/tiny-reverse-proxy-rust/docs/policies/deployment-topology.md)
+- [State and Cache Guarantees](/Users/krystian/code/tiny-reverse-proxy-rust/docs/policies/state-and-cache-guarantees.md)
+- [Release Policy](/Users/krystian/code/tiny-reverse-proxy-rust/docs/policies/release.md)
+- [Reliability Program](/Users/krystian/code/tiny-reverse-proxy-rust/docs/reliability/README.md)
 
 ## Semantic safety deployment
 
@@ -209,3 +258,11 @@ The repo CI now covers:
 - gateway unit/integration tests
 - OpenTelemetry compilation coverage
 - real Postgres/MySQL round-trip gateway store tests with service containers
+- release-gated deterministic validation for probes, retries, shutdown, and
+  startup checks
+- release-gated live gateway `/v1/responses` smoke behind a protected
+  environment
+
+Use [docs/reliability/release-gates.md](/Users/krystian/code/tiny-reverse-proxy-rust/docs/reliability/release-gates.md)
+for the lane map covering PR CI, release-branch validation, release hard gates,
+and maintainer-triggered soak runs.

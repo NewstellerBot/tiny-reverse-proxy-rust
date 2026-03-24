@@ -26,6 +26,9 @@ use proxy_core::plugin::PluginRegistry;
 use proxy_core::plugin::{self, PluginChain};
 use proxy_core::rate_limit::{self, RateLimiter};
 use proxy_core::router::{ReloadableRouter, RouteResolver, Router};
+use proxy_core::runtime::ProbeState;
+#[cfg(feature = "plugin-llm-gateway")]
+use proxy_core::runtime::RuntimeReliabilityState;
 use proxy_core::{http3, proxy_protocol, tls};
 
 /// Tracks active connections and notifies when all have completed.
@@ -66,6 +69,38 @@ impl ConnectionTracker {
             notified.await;
         }
     }
+}
+
+#[cfg(feature = "plugin-llm-gateway")]
+fn plugin_configs_with_preview_features(config: &Config) -> Vec<proxy_core::config::PluginConfig> {
+    let mut plugin_configs = config.plugins.clone();
+    if config.preview_features.is_empty() || plugin_configs.is_empty() {
+        return plugin_configs;
+    }
+
+    let preview_values = toml::Value::Array(
+        config
+            .preview_features
+            .names()
+            .into_iter()
+            .map(toml::Value::String)
+            .collect(),
+    );
+
+    if let Some(plugin) = plugin_configs.iter_mut().find(|plugin| plugin.enabled) {
+        match &mut plugin.config {
+            toml::Value::Table(table) => {
+                table.insert("preview_features".to_string(), preview_values.clone());
+            }
+            other => {
+                let mut table = toml::value::Table::new();
+                table.insert("preview_features".to_string(), preview_values);
+                *other = toml::Value::Table(table);
+            }
+        }
+    }
+
+    plugin_configs
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -155,6 +190,7 @@ async fn accept_loop(
     router: Arc<ArcSwap<Router>>,
     client: HttpClient,
     counter: Arc<AtomicUsize>,
+    inflight_requests: Arc<AtomicUsize>,
     mut shutdown_rx: watch::Receiver<bool>,
     tracker: Arc<ConnectionTracker>,
     health_state: Option<HealthState>,
@@ -169,6 +205,8 @@ async fn accept_loop(
     header_read_timeout: Duration,
     proxy_protocol_enabled: bool,
     h3_port: Option<u16>,
+    probe_state: ProbeState,
+    reliability: proxy_core::config::ReliabilityConfig,
     plugin_chain: Option<Arc<PluginChain>>,
 ) {
     // Mark initial value as seen so changed() waits for actual shutdown signal.
@@ -203,6 +241,9 @@ async fn accept_loop(
                             Arc::clone(&counter),
                         )
                         .with_peer_addr(peer_addr)
+                        .with_admission_counter(Arc::clone(&inflight_requests))
+                        .with_probe_state(probe_state.clone())
+                        .with_reliability_config(&reliability)
                         .with_tls(is_tls)
                         .with_compression(compression_enabled)
                         .with_max_request_body(max_request_body_bytes)
@@ -320,18 +361,22 @@ fn build_router(config: &Config) -> Router {
 async fn build_plugin_chain(
     config: &Config,
     registry: &prometheus::Registry,
-) -> (
-    Option<Arc<PluginChain>>,
-    Option<plugin_llm_gateway::api::LlmGatewayApi>,
-) {
+) -> Result<
+    (
+        Option<Arc<PluginChain>>,
+        Option<plugin_llm_gateway::api::LlmGatewayApi>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let enabled: Vec<_> = config.plugins.iter().filter(|p| p.enabled).collect();
     if enabled.is_empty() {
-        return (None, None);
+        return Ok((None, None));
     }
 
+    let plugin_configs = plugin_configs_with_preview_features(config);
     let store_url = config.store_url.as_deref();
     match plugin_llm_gateway::create_plugins_with_options(
-        &config.plugins,
+        &plugin_configs,
         store_url,
         &config.providers,
         &config.model_aliases,
@@ -345,18 +390,15 @@ async fn build_plugin_chain(
     {
         Ok((plugins, api)) => {
             if plugins.is_empty() {
-                (None, None)
+                Ok((None, None))
             } else {
                 for p in &plugins {
                     tracing::info!("Plugin loaded: {}", p.name());
                 }
-                (Some(Arc::new(PluginChain::new(plugins))), Some(api))
+                Ok((Some(Arc::new(PluginChain::new(plugins))), Some(api)))
             }
         }
-        Err(e) => {
-            tracing::error!("Failed to create LLM gateway plugins: {}", e);
-            (None, None)
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -365,10 +407,10 @@ async fn build_plugin_chain(
 async fn build_plugin_chain(
     config: &Config,
     _registry: &prometheus::Registry,
-) -> (Option<Arc<PluginChain>>, ()) {
+) -> Result<(Option<Arc<PluginChain>>, ()), Box<dyn std::error::Error>> {
     let enabled: Vec<_> = config.plugins.iter().filter(|p| p.enabled).collect();
     if enabled.is_empty() {
-        return (None, ());
+        return Ok((None, ()));
     }
 
     let registry = PluginRegistry::new();
@@ -387,9 +429,9 @@ async fn build_plugin_chain(
     }
 
     if chain_plugins.is_empty() {
-        (None, ())
+        Ok((None, ()))
     } else {
-        (Some(Arc::new(PluginChain::new(chain_plugins))), ())
+        Ok((Some(Arc::new(PluginChain::new(chain_plugins))), ()))
     }
 }
 
@@ -536,15 +578,30 @@ async fn start_server(config_file: &str) -> std::io::Result<()> {
 
     let router = Arc::new(ArcSwap::from_pointee(build_router(&config)));
     let request_counter = Arc::new(AtomicUsize::new(0));
+    let inflight_requests = Arc::new(AtomicUsize::new(0));
     let client = build_client();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let tracker = Arc::new(ConnectionTracker::new());
+    let probe_state = ProbeState::new();
+    #[cfg(feature = "plugin-llm-gateway")]
+    let runtime_reliability = RuntimeReliabilityState::new(
+        Arc::clone(&inflight_requests),
+        config
+            .reliability
+            .max_inflight_requests
+            .map(|value| value as usize),
+        config
+            .reliability
+            .brownout_inflight_requests
+            .map(|value| value as usize),
+        probe_state.clone(),
+    );
 
     let all_upstreams = collect_upstreams(&config);
 
     // Set up TLS (auto-generate or load from files).
     // Retain DER bytes for QUIC config if needed.
-    let (tls_acceptor, tls_certs_for_quic) = if config.tls_auto
+    let (tls_acceptor, mut tls_certs_for_quic) = if config.tls_auto
         && config.tls_cert.is_none()
         && config.tls_key.is_none()
     {
@@ -623,15 +680,17 @@ async fn start_server(config_file: &str) -> std::io::Result<()> {
     // Set up Prometheus metrics.
     // Use a shared Registry so both core proxy and LLM metrics are exposed on /metrics.
     let registry = prometheus::Registry::new();
-    let metrics = config.metrics_port.map(|port| {
+    let metrics = if let Some(port) = config.metrics_port {
         let m = Metrics::new_with_registry(registry.clone());
+        let listener = metrics::bind_metrics_listener(port).await?;
         let m_clone = m.clone();
         tokio::spawn(async move {
-            metrics::start_metrics_server(port, m_clone).await;
+            metrics::serve_metrics_listener(listener, m_clone).await;
         });
-        tracing::info!("Metrics server listening on 0.0.0.0:{}", port);
-        m
-    });
+        Some(m)
+    } else {
+        None
+    };
 
     // Set up health checking if configured.
     let (health_targets, health_state) = if let Some(hc_config) = config.health_check.as_ref() {
@@ -684,8 +743,15 @@ async fn start_server(config_file: &str) -> std::io::Result<()> {
     });
 
     // Build plugin chain from config.
-    let (_plugin_chain_result, _api_handle) = build_plugin_chain(&config, &registry).await;
+    let (_plugin_chain_result, _api_handle) = build_plugin_chain(&config, &registry)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::error!("Failed to create plugin chain: {}", error);
+            exit(1);
+        });
 
+    #[cfg(feature = "plugin-llm-gateway")]
+    let _api_handle = _api_handle.map(|api| api.with_runtime_reliability(runtime_reliability));
     #[cfg(feature = "plugin-llm-gateway")]
     let plugin_chain = _plugin_chain_result;
     #[cfg(not(feature = "plugin-llm-gateway"))]
@@ -701,13 +767,18 @@ async fn start_server(config_file: &str) -> std::io::Result<()> {
             exit(1);
         }
         let api_clone = api.clone();
+        let listener = plugin_llm_gateway::management_server::bind_management_listener(port)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!("Failed to bind management API server: {}", error);
+                exit(1);
+            });
         tokio::spawn(async move {
-            plugin_llm_gateway::management_server::start_management_server_with_auth(
-                port, api_clone, None,
+            plugin_llm_gateway::management_server::serve_management_listener(
+                listener, api_clone, None,
             )
             .await;
         });
-        tracing::info!("Management API server listening on 127.0.0.1:{}", port);
     }
 
     let compression_enabled = config.compression_enabled;
@@ -716,9 +787,25 @@ async fn start_server(config_file: &str) -> std::io::Result<()> {
     let header_read_timeout = Duration::from_secs(config.header_read_timeout_secs);
     let proxy_protocol_enabled = config.proxy_protocol;
 
-    // Determine H3 port (same as main port if TLS is enabled).
-    let h3_port = if tls_acceptor.is_some() {
-        Some(config.port)
+    let reliability = config.reliability.clone();
+    let mut h3_endpoint = None;
+    let h3_port = if let Some((quic_certs, quic_key)) = tls_certs_for_quic.take() {
+        match tls::build_quic_server_config(quic_certs, quic_key) {
+            Ok(quic_config) => match http3::build_quic_endpoint(addr, quic_config) {
+                Ok(endpoint) => {
+                    h3_endpoint = Some(endpoint);
+                    Some(config.port)
+                }
+                Err(error) => {
+                    tracing::warn!("Failed to start HTTP/3 endpoint: {}", error);
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!("Failed to build QUIC TLS config: {}", error);
+                None
+            }
+        }
     } else {
         None
     };
@@ -730,6 +817,7 @@ async fn start_server(config_file: &str) -> std::io::Result<()> {
         let router = Arc::clone(&router);
         let client = client.clone();
         let counter = Arc::clone(&request_counter);
+        let inflight = Arc::clone(&inflight_requests);
         let rx = shutdown_rx.clone();
         let tracker = Arc::clone(&tracker);
         let hs = health_state.clone();
@@ -739,11 +827,14 @@ async fn start_server(config_file: &str) -> std::io::Result<()> {
         let cb = circuit_breaker.clone();
         let c = cache.clone();
         let pc = plugin_chain.clone();
+        let probe = probe_state.clone();
+        let reliability = reliability.clone();
         tokio::spawn(accept_loop(
             listener,
             router,
             client,
             counter,
+            inflight,
             rx,
             tracker,
             hs,
@@ -758,40 +849,43 @@ async fn start_server(config_file: &str) -> std::io::Result<()> {
             header_read_timeout,
             proxy_protocol_enabled,
             h3_port,
+            probe,
+            reliability,
             pc,
         ));
     }
 
     // Launch HTTP/3 endpoint if TLS is configured.
-    if let Some((quic_certs, quic_key)) = tls_certs_for_quic {
-        match tls::build_quic_server_config(quic_certs, quic_key) {
-            Ok(quic_config) => match http3::build_quic_endpoint(addr, quic_config) {
-                Ok(endpoint) => {
-                    let h3_deps = Arc::new(http3::H3Deps {
-                        router: Arc::clone(&router),
-                        client: client.clone(),
-                        counter: Arc::clone(&request_counter),
-                        health_state: health_state.clone(),
-                        upstream_timeout_secs,
-                        rate_limiter: rate_limiter.clone(),
-                        metrics: metrics.clone(),
-                        circuit_breaker: circuit_breaker.clone(),
-                        cache: cache.clone(),
-                        plugins: plugin_chain.clone(),
-                        compression_enabled,
-                        max_request_body_bytes,
-                    });
-                    tokio::spawn(http3::accept_h3_loop(endpoint, h3_deps));
-                    tracing::info!("HTTP/3 (QUIC) enabled on {}", addr);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to start HTTP/3 endpoint: {}", e);
-                }
-            },
-            Err(e) => {
-                tracing::warn!("Failed to build QUIC TLS config: {}", e);
-            }
-        }
+    if let Some(endpoint) = h3_endpoint {
+        let h3_deps = Arc::new(http3::H3Deps {
+            router: Arc::clone(&router),
+            client: client.clone(),
+            counter: Arc::clone(&request_counter),
+            inflight_requests: Arc::clone(&inflight_requests),
+            health_state: health_state.clone(),
+            upstream_timeout_secs,
+            retry_budget_per_request: reliability.retry_budget_per_request as usize,
+            brownout_inflight_requests: reliability
+                .brownout_inflight_requests
+                .map(|value| value as usize),
+            max_inflight_requests: reliability
+                .max_inflight_requests
+                .map(|value| value as usize),
+            rate_limiter: rate_limiter.clone(),
+            metrics: metrics.clone(),
+            circuit_breaker: circuit_breaker.clone(),
+            cache: cache.clone(),
+            plugins: plugin_chain.clone(),
+            compression_enabled,
+            max_request_body_bytes,
+            probe_state: probe_state.clone(),
+        });
+        tokio::spawn(http3::accept_h3_loop(
+            endpoint,
+            h3_deps,
+            shutdown_rx.clone(),
+        ));
+        tracing::info!("HTTP/3 (QUIC) enabled on {}", addr);
     }
 
     // Drop our copy so only workers hold receivers.
@@ -804,6 +898,8 @@ async fn start_server(config_file: &str) -> std::io::Result<()> {
         .expect("failed to install SIGTERM handler");
 
     let config_file_owned = config_file.to_string();
+
+    probe_state.mark_ready();
 
     loop {
         tokio::select! {
@@ -856,6 +952,7 @@ async fn start_server(config_file: &str) -> std::io::Result<()> {
     }
 
     // Signal shutdown to all accept loops and connections.
+    probe_state.mark_draining("shutdown requested");
     let _ = shutdown_tx.send(true);
 
     // Final flush of LLM gateway state before shutdown.
@@ -908,8 +1005,9 @@ mod tests {
     use hyper::service::service_fn;
     use hyper::{Request, Response, StatusCode};
     use hyper_util::rt::{TokioExecutor, TokioIo};
-    use proxy_core::config::{LbStrategy, RouteConfig};
+    use proxy_core::config::{LbStrategy, ReliabilityConfig, RouteConfig};
     use proxy_core::router::PathResolution;
+    use proxy_core::runtime::ProbeState;
     use serde_json::{json, Value};
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
@@ -980,6 +1078,7 @@ mod tests {
         let proxy_addr = listener.local_addr().unwrap();
         let client = build_client();
         let counter = Arc::new(AtomicUsize::new(0));
+        let inflight = Arc::new(AtomicUsize::new(0));
         let tracker = Arc::new(ConnectionTracker::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -988,6 +1087,7 @@ mod tests {
             router,
             client,
             counter,
+            inflight,
             shutdown_rx,
             tracker,
             None,
@@ -1002,6 +1102,12 @@ mod tests {
             Duration::from_secs(10),
             false,
             None,
+            ProbeState::new(),
+            ReliabilityConfig {
+                max_inflight_requests: None,
+                brownout_inflight_requests: None,
+                retry_budget_per_request: 2,
+            },
             None,
         ));
 
@@ -1487,6 +1593,7 @@ mod tests {
         let proxy_addr = listener.local_addr().unwrap();
         let client = build_client();
         let counter = Arc::new(AtomicUsize::new(0));
+        let inflight = Arc::new(AtomicUsize::new(0));
         let tracker = Arc::new(ConnectionTracker::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -1495,6 +1602,7 @@ mod tests {
             Arc::clone(&router),
             client,
             counter,
+            inflight,
             shutdown_rx,
             tracker,
             None,
@@ -1509,6 +1617,12 @@ mod tests {
             Duration::from_secs(5),
             false,
             None,
+            ProbeState::new(),
+            ReliabilityConfig {
+                max_inflight_requests: None,
+                brownout_inflight_requests: None,
+                retry_budget_per_request: 2,
+            },
             None,
         ));
 
@@ -1572,6 +1686,7 @@ mod tests {
         let proxy_addr = listener.local_addr().unwrap();
         let client = build_client();
         let counter = Arc::new(AtomicUsize::new(0));
+        let inflight = Arc::new(AtomicUsize::new(0));
         let tracker = Arc::new(ConnectionTracker::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -1580,6 +1695,7 @@ mod tests {
             Arc::clone(&router),
             client,
             counter,
+            inflight,
             shutdown_rx,
             tracker,
             None,
@@ -1594,6 +1710,12 @@ mod tests {
             Duration::from_secs(5),
             false,
             None,
+            ProbeState::new(),
+            ReliabilityConfig {
+                max_inflight_requests: None,
+                brownout_inflight_requests: None,
+                retry_budget_per_request: 2,
+            },
             None,
         ));
 

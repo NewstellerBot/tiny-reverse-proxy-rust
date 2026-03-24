@@ -1,3 +1,10 @@
+//! Typed management and recovery API for gateway state.
+//!
+//! Export/import and revision snapshots are store-backed control-plane artifacts. They are meant
+//! for explicit operator workflows, not as node-local caches.
+
+use std::collections::HashSet;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,7 +15,7 @@ use crate::evals::{
     ProjectEvalRunComparison, ProjectEvalRunComparisonGateRequest, ProjectEvalRunExecution,
     ProjectEvalRunRequest,
 };
-use crate::governance::GovernanceState;
+use crate::governance::{generate_unique_id, GovernanceState};
 use crate::prompt_cache::{PromptCache, PromptCacheStatusSnapshot};
 use crate::provider_failover::{
     FailedProviderStatus, ProviderConfig, ProviderFailover, ProviderFailureReason,
@@ -35,7 +42,9 @@ use crate::virtual_keys::{VirtualKeyLookupError, VirtualKeys};
 use proxy_auth::service::AuthService;
 use proxy_auth::store::{PrincipalRecord, ProjectRecord, RoleBindingRecord, TokenRecord};
 use proxy_auth::{AuthContext, Authenticator, Authorizer, Permission, ProjectId, Role};
-use proxy_core::config::ProviderKeyConfig;
+use proxy_core::config::{PreviewFeatureSet, PreviewFeatureStatus, ProviderKeyConfig};
+use proxy_core::runtime::{RuntimeReliabilitySnapshot, RuntimeReliabilityState};
+use serde::{Deserialize, Serialize};
 
 /// Typed Rust API for interacting with LLM gateway plugin state.
 ///
@@ -54,6 +63,8 @@ pub struct LlmGatewayApi {
     store: Option<Arc<Store>>,
     auth_service: Option<Arc<AuthService>>,
     governance: Option<Arc<GovernanceState>>,
+    preview_features: PreviewFeatureSet,
+    runtime_reliability: Option<RuntimeReliabilityState>,
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +117,55 @@ pub struct PrincipalAccessSnapshot {
     pub project_access: Vec<ProjectAccessSnapshot>,
 }
 
+static PROJECT_CONFIG_REVISION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectConfigSnapshot {
+    pub project_id: String,
+    pub policy: Option<ProjectPolicyRecord>,
+    pub routing_rules: Vec<RoutingRuleRecord>,
+    pub safety_policy: Option<SafetyPolicyRecord>,
+    pub semantic_policy: Option<ProjectSemanticPolicyRecord>,
+    pub tools: Vec<ProjectToolRecord>,
+    pub prompts: Vec<ProjectPromptRecord>,
+    pub rollout_policies: Vec<ProjectRolloutPolicyRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectConfigRevision {
+    pub revision_id: String,
+    pub project_id: String,
+    pub source: String,
+    pub snapshot: ProjectConfigSnapshot,
+    pub recorded_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectConfigRevisionState {
+    pub project_id: String,
+    pub active_revision_id: String,
+    pub last_known_good_revision_id: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ControlPlaneProjectSnapshot {
+    pub project_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub active: bool,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ControlPlaneSnapshot {
+    pub exported_at: String,
+    pub projects: Vec<ControlPlaneProjectSnapshot>,
+    pub managed_providers: Vec<ManagedProviderRecord>,
+    pub virtual_keys: Vec<VirtualKeyRecord>,
+    pub project_configs: Vec<ProjectConfigSnapshot>,
+}
+
 impl LlmGatewayApi {
     pub fn new(
         cost_tracker: Option<CostTracker>,
@@ -130,7 +190,14 @@ impl LlmGatewayApi {
             store,
             auth_service: None,
             governance: None,
+            preview_features: PreviewFeatureSet::default(),
+            runtime_reliability: None,
         }
+    }
+
+    pub fn with_preview_features(mut self, preview_features: PreviewFeatureSet) -> Self {
+        self.preview_features = preview_features;
+        self
     }
 
     pub fn with_governance(
@@ -141,6 +208,539 @@ impl LlmGatewayApi {
         self.auth_service = Some(auth_service);
         self.governance = Some(governance);
         self
+    }
+
+    pub fn with_runtime_reliability(
+        mut self,
+        runtime_reliability: RuntimeReliabilityState,
+    ) -> Self {
+        self.runtime_reliability = Some(runtime_reliability);
+        self
+    }
+
+    fn validate_project_config_snapshot_inner(
+        snapshot: &ProjectConfigSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if snapshot.project_id.trim().is_empty() {
+            return Err("project config snapshot project_id must not be empty".into());
+        }
+
+        let project_id = snapshot.project_id.as_str();
+        if snapshot
+            .policy
+            .as_ref()
+            .is_some_and(|record| record.project_id != project_id)
+        {
+            return Err("project policy project_id does not match snapshot project_id".into());
+        }
+        if snapshot
+            .safety_policy
+            .as_ref()
+            .is_some_and(|record| record.project_id != project_id)
+        {
+            return Err("safety policy project_id does not match snapshot project_id".into());
+        }
+        if snapshot
+            .semantic_policy
+            .as_ref()
+            .is_some_and(|record| record.project_id != project_id)
+        {
+            return Err("semantic policy project_id does not match snapshot project_id".into());
+        }
+
+        for record in &snapshot.routing_rules {
+            if record.project_id != project_id {
+                return Err("routing rule project_id does not match snapshot project_id".into());
+            }
+            if let Some(raw) = &record.match_headers {
+                let _: serde_json::Value = serde_json::from_str(raw)?;
+            }
+            if let Some(raw) = &record.provider_order {
+                let _: serde_json::Value = serde_json::from_str(raw)?;
+            }
+            if let Some(raw) = &record.provider_weights {
+                let _: serde_json::Value = serde_json::from_str(raw)?;
+            }
+        }
+        for record in &snapshot.tools {
+            if record.project_id != project_id {
+                return Err("tool project_id does not match snapshot project_id".into());
+            }
+            let _: serde_json::Value = serde_json::from_str(&record.input_schema_json)?;
+            if let Some(raw) = &record.executor_config_json {
+                let _: serde_json::Value = serde_json::from_str(raw)?;
+            }
+        }
+        for record in &snapshot.prompts {
+            if record.project_id != project_id {
+                return Err("prompt project_id does not match snapshot project_id".into());
+            }
+            if let Some(raw) = &record.variables_schema_json {
+                let _: serde_json::Value = serde_json::from_str(raw)?;
+            }
+            if let Some(raw) = &record.rollout_metadata_json {
+                let _: serde_json::Value = serde_json::from_str(raw)?;
+            }
+        }
+        for record in &snapshot.rollout_policies {
+            if record.project_id != project_id {
+                return Err("rollout policy project_id does not match snapshot project_id".into());
+            }
+            let _: serde_json::Value = serde_json::from_str(&record.gate_config_json)?;
+        }
+
+        if let Some(record) = snapshot.policy.as_ref() {
+            for raw in [
+                &record.fallback_order,
+                &record.provider_rpm_limits,
+                &record.provider_tpm_limits,
+                &record.provider_timeouts,
+                &record.provider_input_costs,
+                &record.provider_output_costs,
+                &record.allowed_tools,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let _: serde_json::Value = serde_json::from_str(raw)?;
+            }
+        }
+        if let Some(record) = snapshot.safety_policy.as_ref() {
+            if let Some(raw) = &record.rules_json {
+                let _: serde_json::Value = serde_json::from_str(raw)?;
+            }
+        }
+        if let Some(record) = snapshot.semantic_policy.as_ref() {
+            if let Some(raw) = &record.entities_json {
+                let _: serde_json::Value = serde_json::from_str(raw)?;
+            }
+            if let Some(raw) = &record.topics_json {
+                let _: serde_json::Value = serde_json::from_str(raw)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_project_config_snapshot_against_runtime(
+        &self,
+        snapshot: &ProjectConfigSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Self::validate_project_config_snapshot_inner(snapshot)?;
+
+        if let Some(projects) = self.list_projects() {
+            if !projects
+                .iter()
+                .any(|project| project.project_id == snapshot.project_id)
+            {
+                return Err(format!("project '{}' does not exist", snapshot.project_id).into());
+            }
+        }
+
+        let configured_provider_names: HashSet<String> = self
+            .configured_providers()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|provider| provider.name)
+            .collect();
+        if configured_provider_names.is_empty() {
+            return Ok(());
+        }
+
+        Self::validate_project_config_snapshot_provider_references(
+            snapshot,
+            &configured_provider_names,
+        )
+    }
+
+    fn validate_project_config_snapshot_provider_references(
+        snapshot: &ProjectConfigSnapshot,
+        configured_provider_names: &HashSet<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let ensure_provider_names = |names: Vec<String>,
+                                     field: &str|
+         -> Result<(), Box<dyn std::error::Error>> {
+            for name in names {
+                if !configured_provider_names.contains(&name) {
+                    return Err(format!("unknown provider '{name}' referenced by {field}").into());
+                }
+            }
+            Ok(())
+        };
+
+        if let Some(policy) = snapshot.policy.as_ref() {
+            if let Some(raw) = &policy.fallback_order {
+                let names: Vec<String> = serde_json::from_str(raw)?;
+                ensure_provider_names(names, "policy.fallback_order")?;
+            }
+            for (field, raw) in [
+                (
+                    "policy.provider_rpm_limits",
+                    policy.provider_rpm_limits.as_deref(),
+                ),
+                (
+                    "policy.provider_tpm_limits",
+                    policy.provider_tpm_limits.as_deref(),
+                ),
+                (
+                    "policy.provider_timeouts",
+                    policy.provider_timeouts.as_deref(),
+                ),
+                (
+                    "policy.provider_input_costs",
+                    policy.provider_input_costs.as_deref(),
+                ),
+                (
+                    "policy.provider_output_costs",
+                    policy.provider_output_costs.as_deref(),
+                ),
+            ] {
+                if let Some(raw) = raw {
+                    let keys: serde_json::Map<String, serde_json::Value> =
+                        serde_json::from_str(raw)?;
+                    ensure_provider_names(keys.into_iter().map(|(key, _)| key).collect(), field)?;
+                }
+            }
+        }
+
+        let mut routing_rule_ids = HashSet::new();
+        for rule in &snapshot.routing_rules {
+            if !routing_rule_ids.insert(rule.rule_id.clone()) {
+                return Err(format!("duplicate routing rule id '{}'", rule.rule_id).into());
+            }
+            if let Some(raw) = &rule.provider_order {
+                let names: Vec<String> = serde_json::from_str(raw)?;
+                ensure_provider_names(names, "routing_rule.provider_order")?;
+            }
+            if let Some(raw) = &rule.provider_weights {
+                let keys: serde_json::Map<String, serde_json::Value> = serde_json::from_str(raw)?;
+                ensure_provider_names(
+                    keys.into_iter().map(|(key, _)| key).collect(),
+                    "routing_rule.provider_weights",
+                )?;
+            }
+        }
+
+        let mut tool_names = HashSet::new();
+        for tool in &snapshot.tools {
+            if !tool_names.insert(tool.tool_name.clone()) {
+                return Err(format!("duplicate tool '{}'", tool.tool_name).into());
+            }
+        }
+
+        let mut prompt_keys = HashSet::new();
+        for prompt in &snapshot.prompts {
+            let prompt_key = format!(
+                "{}:{}:{}",
+                prompt.prompt_name, prompt.version, prompt.environment
+            );
+            if !prompt_keys.insert(prompt_key.clone()) {
+                return Err(format!("duplicate prompt '{prompt_key}'").into());
+            }
+        }
+
+        let mut rollout_policy_names = HashSet::new();
+        for policy in &snapshot.rollout_policies {
+            if !rollout_policy_names.insert(policy.policy_name.clone()) {
+                return Err(format!("duplicate rollout policy '{}'", policy.policy_name).into());
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_control_plane_snapshot_inner(
+        &self,
+        snapshot: &ControlPlaneSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut project_ids = HashSet::new();
+        for project in &snapshot.projects {
+            if project.project_id.trim().is_empty() {
+                return Err(
+                    "control plane snapshot contains a project with an empty project_id".into(),
+                );
+            }
+            if !project_ids.insert(project.project_id.clone()) {
+                return Err(format!("duplicate project '{}'", project.project_id).into());
+            }
+        }
+
+        let mut provider_names: HashSet<String> = self
+            .static_providers()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|provider| provider.name)
+            .collect();
+        for provider in &snapshot.managed_providers {
+            if provider.name.trim().is_empty() {
+                return Err("control plane snapshot contains a provider with an empty name".into());
+            }
+            if !provider_names.insert(provider.name.clone()) {
+                return Err(format!("duplicate provider '{}'", provider.name).into());
+            }
+        }
+
+        let mut key_hashes = HashSet::new();
+        for key in &snapshot.virtual_keys {
+            if key.key_hash.trim().is_empty() {
+                return Err("control plane snapshot contains a key with an empty key_hash".into());
+            }
+            if !key_hashes.insert(key.key_hash.clone()) {
+                return Err(format!("duplicate virtual key '{}'", key.key_hash).into());
+            }
+            if !project_ids.contains(&key.project_id) {
+                return Err(format!(
+                    "virtual key '{}' references unknown project '{}'",
+                    key.key_hash, key.project_id
+                )
+                .into());
+            }
+            if !provider_names.contains(&key.provider_name) {
+                return Err(format!(
+                    "virtual key '{}' references unknown provider '{}'",
+                    key.key_hash, key.provider_name
+                )
+                .into());
+            }
+        }
+
+        let mut config_project_ids = HashSet::new();
+        for project_config in &snapshot.project_configs {
+            if !project_ids.contains(&project_config.project_id) {
+                return Err(format!(
+                    "project config for '{}' does not have a matching project record",
+                    project_config.project_id
+                )
+                .into());
+            }
+            if !config_project_ids.insert(project_config.project_id.clone()) {
+                return Err(format!(
+                    "duplicate project config snapshot for '{}'",
+                    project_config.project_id
+                )
+                .into());
+            }
+            Self::validate_project_config_snapshot_inner(project_config)?;
+            Self::validate_project_config_snapshot_provider_references(
+                project_config,
+                &provider_names,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    async fn project_config_snapshot_inner(
+        &self,
+        project_id: &str,
+    ) -> Result<ProjectConfigSnapshot, Box<dyn std::error::Error>> {
+        let governance = self.governance.as_ref().ok_or("governance not enabled")?;
+
+        let rollout_policies = match self.list_project_rollout_policies(Some(project_id)).await {
+            Some(Ok(records)) => records,
+            Some(Err(error)) => return Err(error),
+            None => Vec::new(),
+        };
+
+        Ok(ProjectConfigSnapshot {
+            project_id: project_id.to_string(),
+            policy: governance.project_policy(project_id),
+            routing_rules: governance.list_routing_rules(Some(project_id)),
+            safety_policy: governance.safety_policy(project_id),
+            semantic_policy: governance.semantic_policy(project_id),
+            tools: governance.list_project_tools(Some(project_id)),
+            prompts: governance.list_project_prompts(Some(project_id), None),
+            rollout_policies,
+        })
+    }
+
+    async fn record_project_config_revision(
+        &self,
+        project_id: &str,
+        source: &str,
+    ) -> Result<Option<ProjectConfigRevision>, Box<dyn std::error::Error>> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(None);
+        };
+        let snapshot = self.project_config_snapshot_inner(project_id).await?;
+        Self::validate_project_config_snapshot_inner(&snapshot)?;
+        let revision_id = generate_unique_id("cfg", &PROJECT_CONFIG_REVISION_SEQUENCE);
+        let revision = ProjectConfigRevision {
+            revision_id: revision_id.clone(),
+            project_id: project_id.to_string(),
+            source: source.to_string(),
+            snapshot,
+            recorded_at: crate::governance::current_timestamp_string(),
+        };
+        let snapshot_json = serde_json::to_string(&revision)?;
+        store
+            .append_governance_change(&GovernanceChangeRecord {
+                change_id: revision_id.clone(),
+                project_id: project_id.to_string(),
+                resource_type: "project_config_revision".to_string(),
+                resource_id: revision_id,
+                action: source.to_string(),
+                before_json: None,
+                after_json: Some(snapshot_json),
+                changed_at: revision.recorded_at.clone(),
+            })
+            .await?;
+        let revision_state = ProjectConfigRevisionState {
+            project_id: project_id.to_string(),
+            active_revision_id: revision.revision_id.clone(),
+            last_known_good_revision_id: revision.revision_id.clone(),
+            updated_at: revision.recorded_at.clone(),
+        };
+        store
+            .append_governance_change(&GovernanceChangeRecord {
+                change_id: generate_unique_id("cfgstate", &PROJECT_CONFIG_REVISION_SEQUENCE),
+                project_id: project_id.to_string(),
+                resource_type: "project_config_revision_state".to_string(),
+                resource_id: project_id.to_string(),
+                action: source.to_string(),
+                before_json: None,
+                after_json: Some(serde_json::to_string(&revision_state)?),
+                changed_at: revision.recorded_at.clone(),
+            })
+            .await?;
+        Ok(Some(revision))
+    }
+
+    async fn apply_project_config_snapshot_inner(
+        &self,
+        snapshot: &ProjectConfigSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.validate_project_config_snapshot_against_runtime(snapshot)?;
+        let governance = self.governance.as_ref().ok_or("governance not enabled")?;
+        let store = self.store.as_ref().ok_or("store not enabled")?;
+
+        match snapshot.policy.clone() {
+            Some(record) => governance.upsert_project_policy(record).await?,
+            None => {
+                governance
+                    .delete_project_policy(&snapshot.project_id)
+                    .await?;
+            }
+        }
+
+        let existing_rule_ids: HashSet<String> = governance
+            .list_routing_rules(Some(&snapshot.project_id))
+            .into_iter()
+            .map(|record| record.rule_id)
+            .collect();
+        let desired_rule_ids: HashSet<String> = snapshot
+            .routing_rules
+            .iter()
+            .map(|record| record.rule_id.clone())
+            .collect();
+        for rule_id in existing_rule_ids.difference(&desired_rule_ids) {
+            governance.delete_routing_rule(rule_id).await?;
+        }
+        for record in &snapshot.routing_rules {
+            governance.upsert_routing_rule(record.clone()).await?;
+        }
+
+        match snapshot.safety_policy.clone() {
+            Some(record) => governance.upsert_safety_policy(record).await?,
+            None => {
+                governance
+                    .delete_safety_policy(&snapshot.project_id)
+                    .await?;
+            }
+        }
+
+        match snapshot.semantic_policy.clone() {
+            Some(record) => {
+                governance.upsert_semantic_policy(record.clone()).await?;
+                if let Some(plugin) = &self.semantic_safety {
+                    let result = plugin.sync_policy_record(&record).await;
+                    if let Some(error) = result.sync_error {
+                        return Err(error.into());
+                    }
+                }
+            }
+            None => {
+                governance
+                    .delete_semantic_policy(&snapshot.project_id)
+                    .await?;
+                if let Some(plugin) = &self.semantic_safety {
+                    plugin
+                        .delete_policy(&snapshot.project_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+
+        let existing_tool_names: HashSet<String> = governance
+            .list_project_tools(Some(&snapshot.project_id))
+            .into_iter()
+            .map(|record| record.tool_name)
+            .collect();
+        let desired_tool_names: HashSet<String> = snapshot
+            .tools
+            .iter()
+            .map(|record| record.tool_name.clone())
+            .collect();
+        for tool_name in existing_tool_names.difference(&desired_tool_names) {
+            governance
+                .delete_project_tool(&snapshot.project_id, tool_name)
+                .await?;
+        }
+        for record in &snapshot.tools {
+            governance.upsert_project_tool(record.clone()).await?;
+        }
+
+        let existing_prompt_keys: HashSet<(String, String)> = governance
+            .list_project_prompts(Some(&snapshot.project_id), None)
+            .into_iter()
+            .map(|record| (record.prompt_name, record.version))
+            .collect();
+        let desired_prompt_keys: HashSet<(String, String)> = snapshot
+            .prompts
+            .iter()
+            .map(|record| (record.prompt_name.clone(), record.version.clone()))
+            .collect();
+        for (prompt_name, version) in existing_prompt_keys.difference(&desired_prompt_keys) {
+            governance
+                .delete_project_prompt(&snapshot.project_id, prompt_name, version)
+                .await?;
+        }
+        for record in &snapshot.prompts {
+            governance.upsert_project_prompt(record.clone()).await?;
+        }
+
+        let existing_rollout_policies: HashSet<String> = store
+            .get_project_rollout_policies(Some(&snapshot.project_id))
+            .await?
+            .into_iter()
+            .map(|record| record.policy_name)
+            .collect();
+        let desired_rollout_policies: HashSet<String> = snapshot
+            .rollout_policies
+            .iter()
+            .map(|record| record.policy_name.clone())
+            .collect();
+        for policy_name in existing_rollout_policies.difference(&desired_rollout_policies) {
+            store
+                .delete_project_rollout_policy(&snapshot.project_id, policy_name)
+                .await?;
+        }
+        for record in &snapshot.rollout_policies {
+            store.upsert_project_rollout_policy(record).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn ensure_project_config_revision_recorded(
+        &self,
+        project_id: &str,
+        source: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.record_project_config_revision(project_id, source)
+            .await?;
+        Ok(())
     }
 
     pub fn auth_service(&self) -> Option<&Arc<AuthService>> {
@@ -537,6 +1137,12 @@ impl LlmGatewayApi {
             .map(|pf| pf.clear_all_failed())
     }
 
+    pub fn runtime_reliability(&self) -> Option<RuntimeReliabilitySnapshot> {
+        self.runtime_reliability
+            .as_ref()
+            .map(RuntimeReliabilityState::snapshot)
+    }
+
     pub fn provider_health(&self) -> Option<Vec<ProviderHealthSnapshot>> {
         let governance = self.governance.as_ref();
         let failover = self.provider_failover.as_ref();
@@ -602,6 +1208,14 @@ impl LlmGatewayApi {
 
     pub fn tool_runtime_status(&self) -> Option<ToolRuntimeStatusSnapshot> {
         self.tool_runtime.as_ref().map(|runtime| runtime.status())
+    }
+
+    pub fn preview_feature_statuses(&self) -> Vec<PreviewFeatureStatus> {
+        self.preview_features.statuses()
+    }
+
+    pub fn preview_feature_enabled(&self, feature: proxy_core::config::PreviewFeature) -> bool {
+        self.preview_features.contains(feature)
     }
 
     pub async fn refresh_tool_runtime_mcp_server(
@@ -923,6 +1537,14 @@ impl LlmGatewayApi {
         Some(vk.delete_key(hash_prefix).await)
     }
 
+    pub async fn upsert_virtual_key_record(
+        &self,
+        record: VirtualKeyRecord,
+    ) -> Option<Result<(), Box<dyn std::error::Error>>> {
+        let vk = self.virtual_keys.as_ref()?;
+        Some(vk.upsert_key_record(record).await)
+    }
+
     pub fn list_projects(&self) -> Option<Vec<ProjectRecord>> {
         Some(self.auth_service.as_ref()?.list_projects())
     }
@@ -1123,8 +1745,252 @@ impl LlmGatewayApi {
         )
     }
 
+    pub async fn export_control_plane_snapshot(
+        &self,
+    ) -> Option<Result<ControlPlaneSnapshot, Box<dyn std::error::Error>>> {
+        let _ = self.auth_service.as_ref()?;
+        let _ = self.virtual_keys.as_ref()?;
+        let projects = self
+            .list_projects()?
+            .into_iter()
+            .map(|project| ControlPlaneProjectSnapshot {
+                project_id: project.project_id,
+                name: project.name,
+                description: project.description,
+                active: project.active,
+                created_at: project.created_at,
+            })
+            .collect::<Vec<_>>();
+        Some(
+            async {
+                let mut project_configs = Vec::with_capacity(projects.len());
+                for project in &projects {
+                    project_configs.push(
+                        self.project_config_snapshot_inner(&project.project_id)
+                            .await?,
+                    );
+                }
+                Ok(ControlPlaneSnapshot {
+                    exported_at: crate::governance::current_timestamp_string(),
+                    projects,
+                    managed_providers: self.managed_providers().unwrap_or_default(),
+                    virtual_keys: self.list_virtual_keys().unwrap_or_default(),
+                    project_configs,
+                })
+            }
+            .await,
+        )
+    }
+
+    pub fn validate_control_plane_snapshot(
+        &self,
+        snapshot: &ControlPlaneSnapshot,
+    ) -> Option<Result<(), Box<dyn std::error::Error>>> {
+        self.auth_service.as_ref()?;
+        self.virtual_keys.as_ref()?;
+        Some(self.validate_control_plane_snapshot_inner(snapshot))
+    }
+
+    pub async fn import_control_plane_snapshot(
+        &self,
+        snapshot: ControlPlaneSnapshot,
+    ) -> Option<Result<(), Box<dyn std::error::Error>>> {
+        let auth_service = self.auth_service.as_ref()?;
+        self.governance.as_ref()?;
+        self.store.as_ref()?;
+        self.virtual_keys.as_ref()?;
+        Some(
+            async {
+                self.validate_control_plane_snapshot_inner(&snapshot)?;
+
+                for project in snapshot.projects {
+                    auth_service
+                        .upsert_project(proxy_auth::store::ProjectRecord {
+                            project_id: project.project_id,
+                            name: project.name,
+                            description: project.description,
+                            active: project.active,
+                            created_at: project.created_at,
+                        })
+                        .await?;
+                }
+
+                for provider in snapshot.managed_providers {
+                    match self.upsert_managed_provider(provider).await {
+                        Some(Ok(())) => {}
+                        Some(Err(error)) => return Err(error),
+                        None => return Err("virtual keys not enabled".into()),
+                    }
+                }
+
+                for project_config in snapshot.project_configs {
+                    match self
+                        .apply_project_config(project_config, "import_control_plane_snapshot")
+                        .await
+                    {
+                        Some(Ok(_revision)) => {}
+                        Some(Err(error)) => return Err(error),
+                        None => return Err("governance or store not enabled".into()),
+                    }
+                }
+
+                for key in snapshot.virtual_keys {
+                    match self.upsert_virtual_key_record(key).await {
+                        Some(Ok(())) => {}
+                        Some(Err(error)) => return Err(error),
+                        None => return Err("virtual keys not enabled".into()),
+                    }
+                }
+
+                Ok(())
+            }
+            .await,
+        )
+    }
+
     pub fn list_project_policies(&self) -> Option<Vec<ProjectPolicyRecord>> {
         Some(self.governance.as_ref()?.list_project_policies())
+    }
+
+    pub async fn export_project_config(
+        &self,
+        project_id: &str,
+    ) -> Option<Result<ProjectConfigSnapshot, Box<dyn std::error::Error>>> {
+        Some(self.project_config_snapshot_inner(project_id).await)
+    }
+
+    pub fn validate_project_config_snapshot(
+        &self,
+        snapshot: &ProjectConfigSnapshot,
+    ) -> Option<Result<(), Box<dyn std::error::Error>>> {
+        self.governance.as_ref()?;
+        Some(self.validate_project_config_snapshot_against_runtime(snapshot))
+    }
+
+    pub async fn list_project_config_revisions(
+        &self,
+        project_id: &str,
+        limit: u32,
+    ) -> Option<Result<Vec<ProjectConfigRevision>, Box<dyn std::error::Error>>> {
+        let changes = match self
+            .get_governance_changes(project_id, Some("project_config_revision"), limit)
+            .await
+        {
+            Some(Ok(changes)) => changes,
+            Some(Err(error)) => return Some(Err(error)),
+            None => return None,
+        };
+        Some(Ok(changes
+            .into_iter()
+            .filter_map(|change| change.after_json)
+            .filter_map(|raw| serde_json::from_str::<ProjectConfigRevision>(&raw).ok())
+            .collect()))
+    }
+
+    pub async fn get_project_config_revision(
+        &self,
+        project_id: &str,
+        revision_id: &str,
+    ) -> Option<Result<Option<ProjectConfigRevision>, Box<dyn std::error::Error>>> {
+        let revisions = match self.list_project_config_revisions(project_id, 500).await {
+            Some(Ok(revisions)) => revisions,
+            Some(Err(error)) => return Some(Err(error)),
+            None => return None,
+        };
+        Some(Ok(revisions
+            .into_iter()
+            .find(|revision| revision.revision_id == revision_id)))
+    }
+
+    pub async fn get_project_config_revision_state(
+        &self,
+        project_id: &str,
+    ) -> Option<Result<Option<ProjectConfigRevisionState>, Box<dyn std::error::Error>>> {
+        let changes = match self
+            .get_governance_changes(project_id, Some("project_config_revision_state"), 1)
+            .await
+        {
+            Some(Ok(changes)) => changes,
+            Some(Err(error)) => return Some(Err(error)),
+            None => return None,
+        };
+        Some(Ok(changes
+            .into_iter()
+            .find_map(|change| change.after_json)
+            .and_then(|raw| {
+                serde_json::from_str::<ProjectConfigRevisionState>(&raw).ok()
+            })))
+    }
+
+    pub async fn apply_project_config(
+        &self,
+        snapshot: ProjectConfigSnapshot,
+        source: &str,
+    ) -> Option<Result<ProjectConfigRevision, Box<dyn std::error::Error>>> {
+        self.governance.as_ref()?;
+        self.store.as_ref()?;
+        Some(async {
+            self.validate_project_config_snapshot_against_runtime(&snapshot)?;
+            let previous_snapshot = self.project_config_snapshot_inner(&snapshot.project_id).await?;
+            let apply_result = self
+                .apply_project_config_snapshot_inner(&snapshot)
+                .await
+                .map_err(|error| error.to_string());
+            if let Err(apply_error) = apply_result {
+                let restore_error = self
+                    .apply_project_config_snapshot_inner(&previous_snapshot)
+                    .await
+                    .err()
+                    .map(|error| error.to_string());
+                let error_message = match restore_error {
+                    Some(restore_error) => format!(
+                        "project config apply failed ({apply_error}); automatic rollback also failed ({restore_error})"
+                    ),
+                    None => format!(
+                        "project config apply failed ({apply_error}); previous snapshot restored"
+                    ),
+                };
+                return Err(error_message.into());
+            }
+            match self
+                .record_project_config_revision(&snapshot.project_id, source)
+                .await?
+            {
+                Some(revision) => Ok(revision),
+                None => Err("store not enabled".into()),
+            }
+        }
+        .await)
+    }
+
+    pub async fn rollback_project_config(
+        &self,
+        project_id: &str,
+        revision_id: &str,
+    ) -> Option<Result<ProjectConfigRevision, Box<dyn std::error::Error>>> {
+        self.governance.as_ref()?;
+        self.store.as_ref()?;
+        Some(
+            async {
+                let revision = match self
+                    .get_project_config_revision(project_id, revision_id)
+                    .await
+                {
+                    Some(Ok(Some(revision))) => revision,
+                    Some(Ok(None)) => {
+                        return Err(format!("revision '{revision_id}' not found").into())
+                    }
+                    Some(Err(error)) => return Err(error),
+                    None => return Err("store not enabled".into()),
+                };
+                let source = format!("rollback_project_config:{revision_id}");
+                match self.apply_project_config(revision.snapshot, &source).await {
+                    Some(result) => result,
+                    None => Err("store not enabled".into()),
+                }
+            }
+            .await,
+        )
     }
 
     pub fn get_project_policy(&self, project_id: &str) -> Option<ProjectPolicyRecord> {
@@ -1135,24 +2001,52 @@ impl LlmGatewayApi {
         &self,
         record: ProjectPolicyRecord,
     ) -> Option<Result<(), Box<dyn std::error::Error>>> {
-        Some(
-            self.governance
-                .as_ref()?
-                .upsert_project_policy(record)
-                .await,
-        )
+        let governance = self.governance.as_ref()?;
+        let project_id = record.project_id.clone();
+        let upsert_result = governance
+            .upsert_project_policy(record)
+            .await
+            .map_err(|error| error.to_string());
+        Some(match upsert_result {
+            Ok(()) => {
+                match self
+                    .ensure_project_config_revision_recorded(&project_id, "upsert_project_policy")
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error.into()),
+        })
     }
 
     pub async fn delete_project_policy(
         &self,
         project_id: &str,
     ) -> Option<Result<bool, Box<dyn std::error::Error>>> {
-        Some(
-            self.governance
-                .as_ref()?
-                .delete_project_policy(project_id)
-                .await,
-        )
+        let governance = self.governance.as_ref()?;
+        let delete_result = governance
+            .delete_project_policy(project_id)
+            .await
+            .map_err(|error| error.to_string());
+        Some(match delete_result {
+            Ok(result) => {
+                if result {
+                    if let Err(error) = self
+                        .ensure_project_config_revision_recorded(
+                            project_id,
+                            "delete_project_policy",
+                        )
+                        .await
+                    {
+                        return Some(Err(error));
+                    }
+                }
+                Ok(result)
+            }
+            Err(error) => Err(error.into()),
+        })
     }
 
     pub async fn get_governance_changes(
@@ -1178,14 +2072,59 @@ impl LlmGatewayApi {
         &self,
         record: RoutingRuleRecord,
     ) -> Option<Result<(), Box<dyn std::error::Error>>> {
-        Some(self.governance.as_ref()?.upsert_routing_rule(record).await)
+        let governance = self.governance.as_ref()?;
+        let project_id = record.project_id.clone();
+        let upsert_result = governance
+            .upsert_routing_rule(record)
+            .await
+            .map_err(|error| error.to_string());
+        Some(match upsert_result {
+            Ok(()) => {
+                match self
+                    .ensure_project_config_revision_recorded(&project_id, "upsert_routing_rule")
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error.into()),
+        })
     }
 
     pub async fn delete_routing_rule(
         &self,
         rule_id: &str,
     ) -> Option<Result<bool, Box<dyn std::error::Error>>> {
-        Some(self.governance.as_ref()?.delete_routing_rule(rule_id).await)
+        let governance = self.governance.as_ref()?;
+        let project_id = governance
+            .list_routing_rules(None)
+            .into_iter()
+            .find(|record| record.rule_id == rule_id)
+            .map(|record| record.project_id);
+        let delete_result = governance
+            .delete_routing_rule(rule_id)
+            .await
+            .map_err(|error| error.to_string());
+        Some(match delete_result {
+            Ok(result) => {
+                if result {
+                    if let Some(project_id) = project_id.as_deref() {
+                        if let Err(error) = self
+                            .ensure_project_config_revision_recorded(
+                                project_id,
+                                "delete_routing_rule",
+                            )
+                            .await
+                        {
+                            return Some(Err(error));
+                        }
+                    }
+                }
+                Ok(result)
+            }
+            Err(error) => Err(error.into()),
+        })
     }
 
     pub fn list_safety_policies(&self) -> Option<Vec<SafetyPolicyRecord>> {
@@ -1200,19 +2139,49 @@ impl LlmGatewayApi {
         &self,
         record: SafetyPolicyRecord,
     ) -> Option<Result<(), Box<dyn std::error::Error>>> {
-        Some(self.governance.as_ref()?.upsert_safety_policy(record).await)
+        let governance = self.governance.as_ref()?;
+        let project_id = record.project_id.clone();
+        let upsert_result = governance
+            .upsert_safety_policy(record)
+            .await
+            .map_err(|error| error.to_string());
+        Some(match upsert_result {
+            Ok(()) => {
+                match self
+                    .ensure_project_config_revision_recorded(&project_id, "upsert_safety_policy")
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error.into()),
+        })
     }
 
     pub async fn delete_safety_policy(
         &self,
         project_id: &str,
     ) -> Option<Result<bool, Box<dyn std::error::Error>>> {
-        Some(
-            self.governance
-                .as_ref()?
-                .delete_safety_policy(project_id)
-                .await,
-        )
+        let governance = self.governance.as_ref()?;
+        let delete_result = governance
+            .delete_safety_policy(project_id)
+            .await
+            .map_err(|error| error.to_string());
+        Some(match delete_result {
+            Ok(result) => {
+                if result {
+                    if let Err(error) = self
+                        .ensure_project_config_revision_recorded(project_id, "delete_safety_policy")
+                        .await
+                    {
+                        return Some(Err(error));
+                    }
+                }
+                Ok(result)
+            }
+            Err(error) => Err(error.into()),
+        })
     }
 
     pub fn list_safety_detectors(
@@ -1249,6 +2218,17 @@ impl LlmGatewayApi {
                 sync_error: Some("semantic safety plugin not enabled".to_string()),
             },
         };
+        if result.synced || result.sync_error.is_some() {
+            if let Err(error) = self
+                .ensure_project_config_revision_recorded(
+                    &record.project_id,
+                    "upsert_semantic_policy",
+                )
+                .await
+            {
+                return Some(Err(error));
+            }
+        }
         Some(Ok(result))
     }
 
@@ -1280,6 +2260,14 @@ impl LlmGatewayApi {
                 sync_error: Some("semantic safety plugin not enabled".to_string()),
             },
         };
+        if existed {
+            if let Err(error) = self
+                .ensure_project_config_revision_recorded(project_id, "delete_semantic_policy")
+                .await
+            {
+                return Some(Err(error));
+            }
+        }
         Some(Ok(sync))
     }
 
@@ -1297,7 +2285,24 @@ impl LlmGatewayApi {
         &self,
         record: ProjectToolRecord,
     ) -> Option<Result<(), Box<dyn std::error::Error>>> {
-        Some(self.governance.as_ref()?.upsert_project_tool(record).await)
+        let governance = self.governance.as_ref()?;
+        let project_id = record.project_id.clone();
+        let upsert_result = governance
+            .upsert_project_tool(record)
+            .await
+            .map_err(|error| error.to_string());
+        Some(match upsert_result {
+            Ok(()) => {
+                match self
+                    .ensure_project_config_revision_recorded(&project_id, "upsert_project_tool")
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error.into()),
+        })
     }
 
     pub async fn delete_project_tool(
@@ -1305,12 +2310,25 @@ impl LlmGatewayApi {
         project_id: &str,
         tool_name: &str,
     ) -> Option<Result<bool, Box<dyn std::error::Error>>> {
-        Some(
-            self.governance
-                .as_ref()?
-                .delete_project_tool(project_id, tool_name)
-                .await,
-        )
+        let governance = self.governance.as_ref()?;
+        let delete_result = governance
+            .delete_project_tool(project_id, tool_name)
+            .await
+            .map_err(|error| error.to_string());
+        Some(match delete_result {
+            Ok(result) => {
+                if result {
+                    if let Err(error) = self
+                        .ensure_project_config_revision_recorded(project_id, "delete_project_tool")
+                        .await
+                    {
+                        return Some(Err(error));
+                    }
+                }
+                Ok(result)
+            }
+            Err(error) => Err(error.into()),
+        })
     }
 
     pub fn list_project_prompts(
@@ -1340,12 +2358,24 @@ impl LlmGatewayApi {
         &self,
         record: ProjectPromptRecord,
     ) -> Option<Result<(), Box<dyn std::error::Error>>> {
-        Some(
-            self.governance
-                .as_ref()?
-                .upsert_project_prompt(record)
-                .await,
-        )
+        let governance = self.governance.as_ref()?;
+        let project_id = record.project_id.clone();
+        let upsert_result = governance
+            .upsert_project_prompt(record)
+            .await
+            .map_err(|error| error.to_string());
+        Some(match upsert_result {
+            Ok(()) => {
+                match self
+                    .ensure_project_config_revision_recorded(&project_id, "upsert_project_prompt")
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error.into()),
+        })
     }
 
     pub async fn delete_project_prompt(
@@ -1354,11 +2384,29 @@ impl LlmGatewayApi {
         prompt_name: &str,
         version: &str,
     ) -> Option<Result<bool, Box<dyn std::error::Error>>> {
+        let governance = self.governance.as_ref()?;
         Some(
-            self.governance
-                .as_ref()?
+            match governance
                 .delete_project_prompt(project_id, prompt_name, version)
-                .await,
+                .await
+                .map_err(|error| error.to_string())
+            {
+                Ok(result) => {
+                    if result {
+                        if let Err(error) = self
+                            .ensure_project_config_revision_recorded(
+                                project_id,
+                                "delete_project_prompt",
+                            )
+                            .await
+                        {
+                            return Some(Err(error));
+                        }
+                    }
+                    Ok(result)
+                }
+                Err(error) => Err(error.into()),
+            },
         )
     }
 
@@ -1394,12 +2442,25 @@ impl LlmGatewayApi {
         record: ProjectRolloutPolicyRecord,
     ) -> Option<Result<(), Box<dyn std::error::Error>>> {
         let store = self.store.as_ref()?;
-        Some(
-            store
-                .upsert_project_rollout_policy(&record)
-                .await
-                .map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
-        )
+        let upsert_result = store
+            .upsert_project_rollout_policy(&record)
+            .await
+            .map_err(|error| error.to_string());
+        Some(match upsert_result {
+            Ok(()) => {
+                match self
+                    .ensure_project_config_revision_recorded(
+                        &record.project_id,
+                        "upsert_project_rollout_policy",
+                    )
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error.into()),
+        })
     }
 
     pub async fn delete_project_rollout_policy(
@@ -1408,12 +2469,27 @@ impl LlmGatewayApi {
         policy_name: &str,
     ) -> Option<Result<bool, Box<dyn std::error::Error>>> {
         let store = self.store.as_ref()?;
-        Some(
-            store
-                .delete_project_rollout_policy(project_id, policy_name)
-                .await
-                .map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
-        )
+        let delete_result = store
+            .delete_project_rollout_policy(project_id, policy_name)
+            .await
+            .map_err(|error| error.to_string());
+        Some(match delete_result {
+            Ok(result) => {
+                if result {
+                    if let Err(error) = self
+                        .ensure_project_config_revision_recorded(
+                            project_id,
+                            "delete_project_rollout_policy",
+                        )
+                        .await
+                    {
+                        return Some(Err(error));
+                    }
+                }
+                Ok(result)
+            }
+            Err(error) => Err(error.into()),
+        })
     }
 
     pub async fn list_project_prompt_rollouts(

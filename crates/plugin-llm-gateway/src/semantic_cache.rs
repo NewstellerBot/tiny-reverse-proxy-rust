@@ -1,3 +1,8 @@
+//! Semantic request cache and routing affinity state.
+//!
+//! Cached matches are advisory and local to a node. Correctness must continue to come from the
+//! request path plus store-backed governance state even after cache loss or cache divergence.
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -16,7 +21,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::header::{HeaderValue, CONTENT_LENGTH, CONTENT_TYPE};
 use hyper::{Response, StatusCode};
-use proxy_core::plugin::{Action, Plugin, RequestContext};
+use proxy_core::plugin::{Action, BrownoutMode, Plugin, RequestContext};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -425,6 +430,14 @@ impl Plugin for SemanticCache {
     }
 
     async fn on_request(&self, ctx: &mut RequestContext) -> Action {
+        if ctx
+            .extensions
+            .get::<BrownoutMode>()
+            .map(|mode| mode.disable_semantic_cache)
+            .unwrap_or(false)
+        {
+            return Action::Continue;
+        }
         let Some(virtual_key) = ctx.extensions.get::<VirtualKeyMeta>().cloned() else {
             return Action::Continue;
         };

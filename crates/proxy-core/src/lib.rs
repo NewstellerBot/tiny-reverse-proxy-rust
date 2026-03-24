@@ -14,6 +14,7 @@ pub mod load_balancer;
 pub mod metrics;
 pub mod proxy_protocol;
 pub mod rate_limit;
+pub mod runtime;
 pub mod tls;
 
 #[cfg(feature = "opentelemetry")]

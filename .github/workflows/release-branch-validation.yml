@@ -1,0 +1,42 @@
+name: Release Branch Validation
+
+on:
+  push:
+    branches:
+      - "release/*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  reliability:
+    name: Wave 1 Reliability Suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v6
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run deterministic Rust reliability suites
+        run: |
+          cargo test --locked -p proxy-core --test retry_contract --test observability_contract
+          cargo test --locked -p plugin-llm-gateway --test retry_classification_integration --test observability_contract --test compatibility_goldens
+
+      - name: Build gateway binary for harness validation
+        run: cargo build --locked -p tiny-reverse-proxy --features plugin-llm-gateway
+
+      - name: Start shared Postgres for multi-node subset
+        run: docker compose -f tests/reliability/docker-compose.multinode.yml up -d postgres
+
+      - name: Run multi-node correctness subset
+        run: uv run python tests/reliability/multinode/run.py
+
+      - name: Stop multi-node Postgres
+        if: always()
+        run: docker compose -f tests/reliability/docker-compose.multinode.yml down -v

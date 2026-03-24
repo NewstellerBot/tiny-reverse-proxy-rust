@@ -18,6 +18,7 @@ virtual keys, governance, safety, tools, and prompt-cache/runtime visibility.
   - budget limit and tracked-key counts where applicable
 - `GET /api/v1/providers`
   - configured providers
+  - provider family stability (`stable`, `preview`, `experimental`)
   - tool protocol / managed-tool capability
   - prompt-cache protocol / request-control capability
   - configured models and per-provider timeout override
@@ -33,6 +34,7 @@ virtual keys, governance, safety, tools, and prompt-cache/runtime visibility.
 - `GET /api/v1/rate-limiter/status`
   - configured rate and burst plus tracked key count
 - `GET /api/v1/tool-runtime/status`
+  - preview feature registry and enforcement mode
   - webhook/web-search backends
   - MCP server reachability / discovery / recovery / budget status
   - operator state, derived health state, and recommended action for each MCP server
@@ -166,6 +168,14 @@ Project-scoped policy endpoints cover the main runtime controls:
 These are exposed under `/api/v1/projects/{project_id}/...` and persist through
 SQLite, Postgres, or MySQL when `store_url` is configured.
 
+Control-plane export/validate/import is also available:
+
+- `GET /api/v1/control-plane/export`
+- `POST /api/v1/control-plane/validate`
+- `PUT /api/v1/control-plane/import`
+
+`control-plane/import` is preview-gated and must be explicitly enabled.
+
 ## Operational guidance
 
 - Use `GET /api/v1/providers/health` when debugging routing or failover.
@@ -178,3 +188,12 @@ SQLite, Postgres, or MySQL when `store_url` is configured.
 - Use `GET /api/v1/prompt-cache/status` plus `GET /api/v1/providers` to confirm
   which providers can accept gateway-managed cache controls.
 - Keep management API auth enabled anywhere beyond local development.
+- Treat preview feature state in `tool-runtime/status` as part of the operator
+  control plane, not as an implementation detail.
+
+## Policy references
+
+- [Project Policies](/Users/krystian/code/tiny-reverse-proxy-rust/docs/policies/README.md)
+- [Preview Features](/Users/krystian/code/tiny-reverse-proxy-rust/docs/policies/preview-features.md)
+- [State and Cache Guarantees](/Users/krystian/code/tiny-reverse-proxy-rust/docs/policies/state-and-cache-guarantees.md)
+- [Release Policy](/Users/krystian/code/tiny-reverse-proxy-rust/docs/policies/release.md)

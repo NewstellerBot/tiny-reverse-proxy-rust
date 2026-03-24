@@ -1,0 +1,49 @@
+{
+  "scenario_id": "batches_native_supported_surface",
+  "request": {
+    "method": "POST",
+    "path": "/v1/batches",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "input_file_id": "file-123",
+      "endpoint": "/v1/responses",
+      "completion_window": "24h",
+      "provider": {
+        "only": ["batch-native"],
+        "allow_fallbacks": false
+      }
+    }
+  },
+  "provider_context": {
+    "family": "openai",
+    "surfaced_protocol": "batches_openai_compatible",
+    "request_mode": "native"
+  },
+  "upstream_response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "id": "batch_123",
+      "object": "batch",
+      "status": "validating"
+    }
+  },
+  "expected_upstream": {
+    "path": "/v1/batches",
+    "body_contains": [
+      "\"input_file_id\":\"file-123\"",
+      "\"endpoint\":\"/v1/responses\""
+    ]
+  },
+  "expected_client": {
+    "status": 200,
+    "body_contains": [
+      "\"id\":\"batch_123\"",
+      "\"status\":\"validating\""
+    ]
+  }
+}

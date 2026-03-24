@@ -65,6 +65,8 @@ Updated: 2026-03-12
 
 - OSS gateway benchmark harness against `tiny-reverse-proxy`, LiteLLM, Bifrost, and direct upstream
 - Pass-through and streaming benchmark scenarios in the OSS shootout harness
+- Competitor-derived reliability matrix and missing-suite backlog under
+  [docs/reliability/README.md](./docs/reliability/README.md)
 - Real DB round-trip coverage for gateway store paths
 - CI coverage for OpenTelemetry compilation and real Postgres/MySQL gateway store tests
 - Realtime smoke tests and tool-runtime black-box integration tests

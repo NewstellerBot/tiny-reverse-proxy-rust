@@ -1,3 +1,9 @@
+//! Virtual key resolution and provider routing.
+//!
+//! Authoritative key/project/provider state is store-backed; the in-memory maps in this module are
+//! node-local caches that must be replaceable from store state without carrying stale entries
+//! across reloads.
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -1376,6 +1382,7 @@ impl VirtualKeys {
         };
 
         self.managed_providers.clear();
+        self.keys.clear();
         for record in store.get_managed_providers().await? {
             self.managed_providers.insert(record.name.clone(), record);
         }
@@ -1404,6 +1411,31 @@ impl VirtualKeys {
         let plaintext = format!("{}{}", KEY_PREFIX, random_hex);
         let hash = hash_key(&plaintext);
         (plaintext, hash)
+    }
+
+    pub async fn upsert_key_record(
+        &self,
+        record: VirtualKeyRecord,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if record.project_id.trim().is_empty() {
+            return Err("virtual key record is missing project_id".into());
+        }
+        if record.key_hash.trim().is_empty() {
+            return Err("virtual key record is missing key_hash".into());
+        }
+        if !self
+            .provider_configs()
+            .iter()
+            .any(|provider| provider.name == record.provider_name)
+        {
+            return Err(format!("unknown provider '{}'", record.provider_name).into());
+        }
+        if let Some(store) = &self.store {
+            store.upsert_virtual_key(&record).await?;
+        }
+        self.keys
+            .insert(record.key_hash.clone(), CachedKey { record });
+        Ok(())
     }
 
     /// Create a new virtual key, persist it, and cache it. Returns the plaintext key.

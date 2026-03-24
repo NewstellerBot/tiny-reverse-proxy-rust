@@ -69,6 +69,14 @@ mod tests {
             "responses_stream_mode".into(),
             toml::Value::String(mode.to_string()),
         );
+        if mode == "composed" {
+            config.insert(
+                "preview_features".into(),
+                toml::Value::Array(vec![toml::Value::String(
+                    "responses_composed_streaming".to_string(),
+                )]),
+            );
+        }
         vec![PluginConfig {
             name: "tool_runtime".into(),
             enabled: true,
@@ -6044,6 +6052,46 @@ mod tests {
             error
                 .to_string()
                 .contains("references unknown mcp server 'missing-mcp'"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_validation_rejects_composed_responses_without_preview_flag() {
+        let providers = vec![openai_provider(
+            "http://127.0.0.1:9999".to_string(),
+            ProviderToolProtocol::OpenAi,
+        )];
+        let configs = vec![PluginConfig {
+            name: "tool_runtime".into(),
+            enabled: true,
+            config: toml::Value::Table({
+                let mut config = toml::value::Map::new();
+                config.insert(
+                    "responses_stream_mode".into(),
+                    toml::Value::String("composed".to_string()),
+                );
+                config
+            }),
+        }];
+
+        let result = plugin_llm_gateway::create_plugins_with_options(
+            &configs,
+            None,
+            &providers,
+            &[],
+            CreatePluginsOptions::default(),
+            None,
+        )
+        .await;
+
+        let error = match result {
+            Ok(_) => panic!("startup should reject composed responses streaming without preview"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.to_string().contains("responses_composed_streaming"),
             "unexpected error: {error}"
         );
     }

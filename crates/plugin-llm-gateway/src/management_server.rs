@@ -11,14 +11,14 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use proxy_auth::{AuthContext, Permission, ProjectId, Role};
 use proxy_core::config::{
-    ProviderDataCollectionMode, ProviderFamily, ProviderFamilyConfig, ProviderKeyConfig,
-    ProviderSurfaceCatalog,
+    PreviewFeature, ProviderDataCollectionMode, ProviderFamily, ProviderFamilyConfig,
+    ProviderKeyConfig, ProviderSurfaceCatalog,
 };
 use semantic_safety_protocol::{ProjectSemanticPolicy, SemanticEntity, SemanticTopic};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use crate::api::LlmGatewayApi;
+use crate::api::{ControlPlaneSnapshot, LlmGatewayApi, ProjectConfigSnapshot};
 use crate::evals::{ProjectEvalRunComparisonGateRequest, ProjectEvalRunRequest};
 use crate::governance::current_timestamp_string;
 use crate::semantic_safety::{generate_semantic_policy_version, proto_to_record, record_to_proto};
@@ -313,6 +313,27 @@ struct ProviderPenaltyResponse {
     rate_limit: f64,
 }
 
+#[derive(Debug, Serialize)]
+struct GatewayStatusResponse {
+    cost_tracker_enabled: bool,
+    rate_limiter_enabled: bool,
+    provider_failover_enabled: bool,
+    tracked_api_keys: usize,
+    rate_limiter_tracked_keys: usize,
+    failed_providers_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reliability: Option<GatewayReliabilityStatusResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct GatewayReliabilityStatusResponse {
+    inflight_requests: usize,
+    max_inflight_requests: Option<usize>,
+    brownout_active: bool,
+    brownout_threshold: Option<usize>,
+    draining: bool,
+}
+
 struct PreparedPromptRolloutDecision {
     policy: ProjectRolloutPolicyRecord,
     candidate_prompt: ProjectPromptRecord,
@@ -321,7 +342,9 @@ struct PreparedPromptRolloutDecision {
 
 /// Start the management HTTP server on the given port.
 pub async fn start_management_server(port: u16, api: LlmGatewayApi) {
-    start_management_server_with_auth(port, api, None).await;
+    start_management_server_with_auth(port, api, None)
+        .await
+        .expect("failed to bind management API server");
 }
 
 /// Start the management HTTP server on localhost with optional bearer auth.
@@ -329,13 +352,23 @@ pub async fn start_management_server_with_auth(
     port: u16,
     api: LlmGatewayApi,
     _auth_token: Option<String>,
-) {
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .await
-        .expect("failed to bind management API server");
+) -> std::io::Result<()> {
+    let listener = bind_management_listener(port).await?;
+    serve_management_listener(listener, api, _auth_token).await;
+    Ok(())
+}
 
+pub async fn bind_management_listener(port: u16) -> std::io::Result<TcpListener> {
+    TcpListener::bind(("127.0.0.1", port)).await
+}
+
+pub async fn serve_management_listener(
+    listener: TcpListener,
+    api: LlmGatewayApi,
+    auth_token: Option<String>,
+) {
     tracing::info!(
-        port,
+        port = listener.local_addr().ok().map(|addr| addr.port()),
         auth_enabled = api.auth_required(),
         "LLM gateway management API listening on 127.0.0.1"
     );
@@ -350,11 +383,13 @@ pub async fn start_management_server_with_auth(
         };
 
         let api = api.clone();
+        let auth_token = auth_token.clone();
         tokio::spawn(async move {
             let io = TokioIo::new(stream);
             let service = service_fn(move |req: Request<Incoming>| {
                 let api = api.clone();
-                async move { handle_request_with_auth(req, api, None).await }
+                let auth_token = auth_token.clone();
+                async move { handle_request_with_auth(req, api, auth_token).await }
             });
 
             if let Err(e) = hyper::server::conn::http1::Builder::new()
@@ -681,6 +716,117 @@ pub async fn handle_request_with_auth(
                 } else {
                     not_found()
                 }
+            } else if path == "/api/v1/control-plane/export" && req.method() == Method::GET {
+                if let Some(resp) =
+                    ensure_permission(&api, auth_ctx.as_ref(), Permission::ViewProjects, None)
+                {
+                    resp
+                } else {
+                    match api.export_control_plane_snapshot().await {
+                        Some(Ok(snapshot)) => json_response(
+                            StatusCode::OK,
+                            serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string()),
+                        ),
+                        Some(Err(error)) => json_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!(r#"{{"error":"{}"}}"#, error),
+                        ),
+                        None => json_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            r#"{"error":"control plane export not available"}"#.to_string(),
+                        ),
+                    }
+                }
+            } else if path == "/api/v1/control-plane/validate" && req.method() == Method::POST {
+                if let Some(resp) =
+                    ensure_permission(&api, auth_ctx.as_ref(), Permission::ManageProjects, None)
+                {
+                    resp
+                } else {
+                    let body = match read_body_string(req).await {
+                        Ok(body) => body,
+                        Err(resp) => return Ok(resp),
+                    };
+                    let snapshot: ControlPlaneSnapshot = match serde_json::from_str(&body) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            return Ok(json_response(
+                                StatusCode::BAD_REQUEST,
+                                format!(
+                                    r#"{{"error":"invalid control plane snapshot: {}"}}"#,
+                                    error
+                                ),
+                            ))
+                        }
+                    };
+                    match api.validate_control_plane_snapshot(&snapshot) {
+                        Some(Ok(())) => json_response(
+                            StatusCode::OK,
+                            serde_json::json!({ "ok": true }).to_string(),
+                        ),
+                        Some(Err(error)) => json_response(
+                            StatusCode::BAD_REQUEST,
+                            format!(r#"{{"error":"{}"}}"#, error),
+                        ),
+                        None => json_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            r#"{"error":"control plane validation not available"}"#.to_string(),
+                        ),
+                    }
+                }
+            } else if path == "/api/v1/control-plane/import" && req.method() == Method::PUT {
+                if let Some(resp) =
+                    ensure_permission(&api, auth_ctx.as_ref(), Permission::ManageProjects, None)
+                {
+                    resp
+                } else {
+                    if !api.preview_feature_enabled(PreviewFeature::ControlPlaneImport) {
+                        return Ok(json_response(
+                            StatusCode::BAD_REQUEST,
+                            serde_json::json!({
+                                "error": "control-plane import requires preview_features to include \"control_plane_import\""
+                            })
+                            .to_string(),
+                        ));
+                    }
+                    let body = match read_body_string(req).await {
+                        Ok(body) => body,
+                        Err(resp) => return Ok(resp),
+                    };
+                    let snapshot: ControlPlaneSnapshot = match serde_json::from_str(&body) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            return Ok(json_response(
+                                StatusCode::BAD_REQUEST,
+                                format!(
+                                    r#"{{"error":"invalid control plane snapshot: {}"}}"#,
+                                    error
+                                ),
+                            ))
+                        }
+                    };
+                    let import_result: Result<(), String> =
+                        match api.import_control_plane_snapshot(snapshot).await {
+                            Some(Ok(())) => Ok(()),
+                            Some(Err(error)) => Err(error.to_string()),
+                            None => {
+                                return Ok(json_response(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    r#"{"error":"control plane import not available"}"#.to_string(),
+                                ))
+                            }
+                        };
+                    match import_result {
+                        Ok(()) => json_response(
+                            StatusCode::OK,
+                            serde_json::json!({ "ok": true }).to_string(),
+                        ),
+                        Err(error) => json_response(
+                            StatusCode::BAD_REQUEST,
+                            format!(r#"{{"error":"{}"}}"#, error),
+                        ),
+                    }
+                }
             } else if let Some(server_path) = path.strip_prefix("/api/v1/tool-runtime/mcp/") {
                 handle_tool_runtime_mcp_subroutes(&api, server_path, req, auth_ctx.as_ref()).await
             } else if let Some(project_id) = path.strip_prefix("/api/v1/projects/") {
@@ -869,17 +1015,29 @@ fn handle_status(api: &LlmGatewayApi) -> Response<Full<Bytes>> {
     let cost_keys = api.cost_usage().map(|u| u.len()).unwrap_or(0);
     let rate_keys = api.rate_limiter_tracked_keys().unwrap_or(0);
     let failed_count = api.failed_providers().map(|f| f.len()).unwrap_or(0);
+    let reliability = api
+        .runtime_reliability()
+        .map(|snapshot| GatewayReliabilityStatusResponse {
+            inflight_requests: snapshot.inflight_requests,
+            max_inflight_requests: snapshot.max_inflight_requests,
+            brownout_active: snapshot.brownout_active,
+            brownout_threshold: snapshot.brownout_threshold,
+            draining: snapshot.draining,
+        });
 
-    let body = format!(
-        r#"{{"cost_tracker_enabled":{},"rate_limiter_enabled":{},"provider_failover_enabled":{},"tracked_api_keys":{},"rate_limiter_tracked_keys":{},"failed_providers_count":{}}}"#,
-        api.cost_tracker_enabled(),
-        api.rate_limiter_enabled(),
-        api.provider_failover_enabled(),
-        cost_keys,
-        rate_keys,
-        failed_count,
-    );
-    json_response(StatusCode::OK, body)
+    json_response(
+        StatusCode::OK,
+        serde_json::to_string(&GatewayStatusResponse {
+            cost_tracker_enabled: api.cost_tracker_enabled(),
+            rate_limiter_enabled: api.rate_limiter_enabled(),
+            provider_failover_enabled: api.provider_failover_enabled(),
+            tracked_api_keys: cost_keys,
+            rate_limiter_tracked_keys: rate_keys,
+            failed_providers_count: failed_count,
+            reliability,
+        })
+        .unwrap(),
+    )
 }
 
 fn handle_cost_usage(api: &LlmGatewayApi) -> Response<Full<Bytes>> {
@@ -1057,6 +1215,21 @@ fn provider_source_name(
     }
 }
 
+fn provider_stability_name(
+    visible_provider: Option<&ProviderKeyConfig>,
+    managed_provider: Option<&ManagedProviderRecord>,
+) -> String {
+    visible_provider
+        .map(|provider| provider.stability().as_str().to_string())
+        .or_else(|| {
+            managed_provider
+                .and_then(|provider| provider.family.as_deref())
+                .and_then(ProviderFamily::parse)
+                .map(|family| family.stability().as_str().to_string())
+        })
+        .unwrap_or_else(|| "experimental".to_string())
+}
+
 fn provider_json(
     api: &LlmGatewayApi,
     name: &str,
@@ -1080,6 +1253,7 @@ fn provider_json(
         .as_ref()
         .map(|provider| provider.family_kind().as_str().to_string())
         .or_else(|| managed_provider.and_then(|provider| provider.family.clone()));
+    let stability = provider_stability_name(visible_provider.as_ref(), managed_provider);
     let provider_surfaces = visible_provider
         .as_ref()
         .and_then(|provider| serde_json::to_value(provider.surfaces()).ok())
@@ -1181,6 +1355,7 @@ fn provider_json(
             .map(|provider| provider.base_url.clone())),
     );
     object.insert("family".to_string(), serde_json::json!(provider_family));
+    object.insert("stability".to_string(), serde_json::json!(stability));
     object.insert(
         "surfaces".to_string(),
         provider_surfaces.unwrap_or(serde_json::Value::Null),
@@ -1801,6 +1976,9 @@ fn handle_tool_runtime_status(api: &LlmGatewayApi) -> Response<Full<Bytes>> {
             "default_timeout_ms": status.default_timeout_ms,
             "max_round_trips": status.max_round_trips,
             "responses_stream_mode": status.responses_stream_mode,
+            "preview_features": status.preview_features.into_iter().map(|feature| {
+                serde_json::to_value(feature).unwrap_or(serde_json::Value::Null)
+            }).collect::<Vec<_>>(),
             "supported_executors": status.supported_executors,
             "web_search_backends": status.web_search_backends.into_iter().map(|backend| {
                 serde_json::json!({
@@ -5316,6 +5494,35 @@ fn parse_json_map_f64(value: Option<&str>) -> std::collections::HashMap<String, 
         .unwrap_or_default()
 }
 
+fn parse_project_config_snapshot_body(
+    body: &str,
+    project_id: &str,
+) -> Result<ProjectConfigSnapshot, String> {
+    let mut value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| format!("invalid project config json: {error}"))?;
+    let serde_json::Value::Object(ref mut object) = value else {
+        return Err("project config payload must be a JSON object".to_string());
+    };
+
+    match object.get("project_id").and_then(|value| value.as_str()) {
+        Some(existing_project_id) if existing_project_id != project_id => {
+            return Err(format!(
+                "project config payload project_id '{existing_project_id}' does not match path '{project_id}'"
+            ));
+        }
+        Some(_) => {}
+        None => {
+            object.insert(
+                "project_id".to_string(),
+                serde_json::Value::String(project_id.to_string()),
+            );
+        }
+    }
+
+    serde_json::from_value(value)
+        .map_err(|error| format!("invalid project config payload: {error}"))
+}
+
 fn project_policy_value(policy: &ProjectPolicyRecord) -> serde_json::Value {
     serde_json::json!({
         "project_id": policy.project_id,
@@ -6668,6 +6875,291 @@ async fn handle_project_subroutes(
                 None => json_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     r#"{"error":"store not enabled"}"#.to_string(),
+                ),
+            }
+        }
+        (&Method::GET, Some("config/export")) => {
+            if let Some(resp) =
+                ensure_permission(api, auth, Permission::ViewProjectPolicy, Some(project_id))
+            {
+                return resp;
+            }
+            match api.export_project_config(project_id).await {
+                Some(Ok(snapshot)) => json_response(
+                    StatusCode::OK,
+                    serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string()),
+                ),
+                Some(Err(error)) => json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(r#"{{"error":"{}"}}"#, error),
+                ),
+                None => json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"error":"governance not enabled"}"#.to_string(),
+                ),
+            }
+        }
+        (&Method::POST, Some("config/validate")) => {
+            if let Some(resp) =
+                ensure_permission(api, auth, Permission::ManageProjectPolicy, Some(project_id))
+            {
+                return resp;
+            }
+            let body = match read_body_string(req).await {
+                Ok(body) => body,
+                Err(resp) => return resp,
+            };
+            let snapshot = match parse_project_config_snapshot_body(&body, project_id) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        format!(r#"{{"error":"{}"}}"#, error),
+                    )
+                }
+            };
+            match api.validate_project_config_snapshot(&snapshot) {
+                Some(Ok(())) => json_response(
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "ok": true,
+                        "project_id": project_id,
+                    })
+                    .to_string(),
+                ),
+                Some(Err(error)) => json_response(
+                    StatusCode::BAD_REQUEST,
+                    format!(r#"{{"error":"{}"}}"#, error),
+                ),
+                None => json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"error":"governance not enabled"}"#.to_string(),
+                ),
+            }
+        }
+        (&Method::PUT, Some("config")) => {
+            if let Some(resp) =
+                ensure_permission(api, auth, Permission::ManageProjectPolicy, Some(project_id))
+            {
+                return resp;
+            }
+            let body = match read_body_string(req).await {
+                Ok(body) => body,
+                Err(resp) => return resp,
+            };
+            let snapshot = match parse_project_config_snapshot_body(&body, project_id) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        format!(r#"{{"error":"{}"}}"#, error),
+                    )
+                }
+            };
+            let apply_result: Result<_, String> = match api
+                .apply_project_config(snapshot, "apply_project_config")
+                .await
+            {
+                Some(Ok(revision)) => Ok(revision),
+                Some(Err(error)) => Err(error.to_string()),
+                None => {
+                    return json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"governance or store not enabled"}"#.to_string(),
+                    )
+                }
+            };
+            match apply_result {
+                Ok(revision) => {
+                    let state = match api.get_project_config_revision_state(project_id).await {
+                        Some(Ok(state)) => state,
+                        Some(Err(error)) => {
+                            return json_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!(r#"{{"error":"{}"}}"#, error),
+                            )
+                        }
+                        None => None,
+                    };
+                    json_response(
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "ok": true,
+                            "project_id": project_id,
+                            "revision": revision,
+                            "state": state,
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(error) => json_response(
+                    StatusCode::BAD_REQUEST,
+                    format!(r#"{{"error":"{}"}}"#, error),
+                ),
+            }
+        }
+        (&Method::GET, Some("revisions")) => {
+            if let Some(resp) =
+                ensure_permission(api, auth, Permission::ViewProjectPolicy, Some(project_id))
+            {
+                return resp;
+            }
+            let query = req.uri().query().unwrap_or("");
+            let limit = extract_query_param(query, "limit")
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(50)
+                .min(500);
+            let revisions_result: Result<_, String> =
+                match api.list_project_config_revisions(project_id, limit).await {
+                    Some(Ok(revisions)) => Ok(revisions),
+                    Some(Err(error)) => Err(error.to_string()),
+                    None => {
+                        return json_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            r#"{"error":"store not enabled"}"#.to_string(),
+                        )
+                    }
+                };
+            match revisions_result {
+                Ok(revisions) => {
+                    let state = match api.get_project_config_revision_state(project_id).await {
+                        Some(Ok(state)) => state,
+                        Some(Err(error)) => {
+                            return json_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!(r#"{{"error":"{}"}}"#, error),
+                            )
+                        }
+                        None => None,
+                    };
+                    json_response(
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "project_id": project_id,
+                            "active_revision_id": state.as_ref().map(|state| state.active_revision_id.clone()),
+                            "last_known_good_revision_id": state.as_ref().map(|state| state.last_known_good_revision_id.clone()),
+                            "revisions": revisions,
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(error) => json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(r#"{{"error":"{}"}}"#, error),
+                ),
+            }
+        }
+        (&Method::GET, Some(remainder)) if remainder.starts_with("revisions/") => {
+            if let Some(resp) =
+                ensure_permission(api, auth, Permission::ViewProjectPolicy, Some(project_id))
+            {
+                return resp;
+            }
+            let revision_id = remainder.trim_start_matches("revisions/");
+            if revision_id.is_empty() {
+                return not_found();
+            }
+            let revision_result: Result<_, String> = match api
+                .get_project_config_revision(project_id, revision_id)
+                .await
+            {
+                Some(Ok(Some(revision))) => Ok(revision),
+                Some(Ok(None)) => {
+                    return json_response(
+                        StatusCode::NOT_FOUND,
+                        r#"{"error":"revision not found"}"#.to_string(),
+                    )
+                }
+                Some(Err(error)) => Err(error.to_string()),
+                None => {
+                    return json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        r#"{"error":"store not enabled"}"#.to_string(),
+                    )
+                }
+            };
+            match revision_result {
+                Ok(revision) => {
+                    let state = match api.get_project_config_revision_state(project_id).await {
+                        Some(Ok(state)) => state,
+                        Some(Err(error)) => {
+                            return json_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!(r#"{{"error":"{}"}}"#, error),
+                            )
+                        }
+                        None => None,
+                    };
+                    json_response(
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "project_id": project_id,
+                            "revision": revision,
+                            "is_active": state.as_ref().is_some_and(|state| state.active_revision_id == revision_id),
+                            "is_last_known_good": state.as_ref().is_some_and(|state| state.last_known_good_revision_id == revision_id),
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(error) => json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(r#"{{"error":"{}"}}"#, error),
+                ),
+            }
+        }
+        (&Method::POST, Some(remainder))
+            if remainder.starts_with("revisions/") && remainder.ends_with("/rollback") =>
+        {
+            if let Some(resp) =
+                ensure_permission(api, auth, Permission::ManageProjectPolicy, Some(project_id))
+            {
+                return resp;
+            }
+            let Some(revision_id) = remainder
+                .strip_prefix("revisions/")
+                .and_then(|path| path.strip_suffix("/rollback"))
+                .filter(|revision_id| !revision_id.is_empty())
+            else {
+                return not_found();
+            };
+            let rollback_result: Result<_, String> =
+                match api.rollback_project_config(project_id, revision_id).await {
+                    Some(Ok(revision)) => Ok(revision),
+                    Some(Err(error)) => Err(error.to_string()),
+                    None => {
+                        return json_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            r#"{"error":"governance or store not enabled"}"#.to_string(),
+                        )
+                    }
+                };
+            match rollback_result {
+                Ok(revision) => {
+                    let state = match api.get_project_config_revision_state(project_id).await {
+                        Some(Ok(state)) => state,
+                        Some(Err(error)) => {
+                            return json_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!(r#"{{"error":"{}"}}"#, error),
+                            )
+                        }
+                        None => None,
+                    };
+                    json_response(
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "ok": true,
+                            "project_id": project_id,
+                            "revision": revision,
+                            "state": state,
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(error) => json_response(
+                    StatusCode::BAD_REQUEST,
+                    format!(r#"{{"error":"{}"}}"#, error),
                 ),
             }
         }

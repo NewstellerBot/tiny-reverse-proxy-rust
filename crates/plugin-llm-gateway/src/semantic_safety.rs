@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use proxy_core::plugin::{Action, Plugin, RequestContext};
+use proxy_core::plugin::{Action, BrownoutMode, Plugin, RequestContext};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -465,6 +465,14 @@ impl Plugin for SemanticSafety {
     }
 
     async fn on_request(&self, ctx: &mut RequestContext) -> Action {
+        if ctx
+            .extensions
+            .get::<BrownoutMode>()
+            .map(|mode| mode.disable_semantic_safety)
+            .unwrap_or(false)
+        {
+            return Action::Continue;
+        }
         ctx.extensions
             .insert(SemanticSafetyReplayHandle(self.clone()));
 

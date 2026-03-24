@@ -1,0 +1,39 @@
+{
+  "scenario_id": "batches_reject_translated_only_target",
+  "request": {
+    "method": "POST",
+    "path": "/v1/batches",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "input_file_id": "file-123",
+      "endpoint": "/v1/responses",
+      "completion_window": "24h"
+    }
+  },
+  "provider_context": {
+    "family": "openai",
+    "surfaced_protocol": "responses_openai_compatible",
+    "request_mode": "translated_only_reject"
+  },
+  "upstream_response": {
+    "status": 200,
+    "headers": {
+      "content-type": "application/json"
+    },
+    "body": {
+      "ignored": true
+    }
+  },
+  "expected_upstream": {
+    "path": "/v1/batches",
+    "body_contains": []
+  },
+  "expected_client": {
+    "status": 400,
+    "body_contains": [
+      "\"provider_capability_unsupported\""
+    ]
+  }
+}

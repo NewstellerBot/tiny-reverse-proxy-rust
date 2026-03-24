@@ -1,0 +1,33 @@
+name: Regression report
+description: Report behavior that used to work and now fails.
+title: "[regression] "
+labels:
+  - regression
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the regression clearly.
+    validations:
+      required: true
+  - type: input
+    id: last_known_good
+    attributes:
+      label: Last known good version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Include exact requests, config, and expected vs actual behavior.
+    validations:
+      required: true
+  - type: input
+    id: scope
+    attributes:
+      label: Affected platform / provider / store
+      description: Example: Ubuntu + SQLite + OpenAI
+    validations:
+      required: true

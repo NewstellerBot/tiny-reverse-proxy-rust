@@ -7,6 +7,7 @@ pub mod schema;
 pub mod sqlite;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 /// Per-key usage record stored in the database.
 #[derive(Debug, Clone)]
@@ -138,7 +139,7 @@ pub struct SessionListQuery {
 }
 
 /// Virtual key record stored in the database.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VirtualKeyRecord {
     pub key_hash: String,
     pub project_id: String,
@@ -159,7 +160,7 @@ pub struct VirtualKeyRecord {
 }
 
 /// Project-scoped defaults for runtime governance.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectPolicyRecord {
     pub project_id: String,
     pub budget_limit: Option<f64>,
@@ -183,7 +184,7 @@ pub struct ProjectPolicyRecord {
 }
 
 /// Store-backed provider override or managed provider definition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagedProviderRecord {
     pub name: String,
     pub enabled: bool,
@@ -200,7 +201,7 @@ pub struct ManagedProviderRecord {
 }
 
 /// Declarative routing rule persisted in the store.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingRuleRecord {
     pub rule_id: String,
     pub project_id: String,
@@ -222,7 +223,7 @@ pub struct RoutingRuleRecord {
 }
 
 /// Sensitive-data policy per project.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SafetyPolicyRecord {
     pub project_id: String,
     pub mode: String,
@@ -231,7 +232,7 @@ pub struct SafetyPolicyRecord {
 }
 
 /// Project-scoped semantic safety policy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectSemanticPolicyRecord {
     pub project_id: String,
     pub version: String,
@@ -271,7 +272,7 @@ pub struct SemanticCacheEntryRecord {
 }
 
 /// Project-scoped registered tool.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectToolRecord {
     pub project_id: String,
     pub tool_name: String,
@@ -285,7 +286,7 @@ pub struct ProjectToolRecord {
 }
 
 /// Project-scoped versioned prompt template.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectPromptRecord {
     pub project_id: String,
     pub prompt_name: String,
@@ -301,7 +302,7 @@ pub struct ProjectPromptRecord {
 }
 
 /// Project-scoped saved rollout policy for eval comparisons and prompt promotion.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectRolloutPolicyRecord {
     pub project_id: String,
     pub policy_name: String,

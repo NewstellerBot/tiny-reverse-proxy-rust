@@ -19,6 +19,7 @@ use crate::metrics::Metrics;
 use crate::plugin::{self, PluginChain};
 use crate::rate_limit::RateLimiter;
 use crate::router::Router;
+use crate::runtime::ProbeState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum H3BodyLimitError {
@@ -61,8 +62,12 @@ pub struct H3Deps {
     pub router: Arc<ArcSwap<Router>>,
     pub client: HttpClient,
     pub counter: Arc<AtomicUsize>,
+    pub inflight_requests: Arc<AtomicUsize>,
     pub health_state: Option<HealthState>,
     pub upstream_timeout_secs: u64,
+    pub retry_budget_per_request: usize,
+    pub brownout_inflight_requests: Option<usize>,
+    pub max_inflight_requests: Option<usize>,
     pub rate_limiter: Option<RateLimiter>,
     pub metrics: Option<Metrics>,
     pub circuit_breaker: Option<CircuitBreaker>,
@@ -70,13 +75,24 @@ pub struct H3Deps {
     pub plugins: Option<Arc<PluginChain>>,
     pub compression_enabled: bool,
     pub max_request_body_bytes: u64,
+    pub probe_state: ProbeState,
 }
 
 /// Run the HTTP/3 accept loop. Each incoming QUIC connection is handled with h3.
-pub async fn accept_h3_loop(endpoint: quinn::Endpoint, deps: Arc<H3Deps>) {
-    while let Some(incoming) = endpoint.accept().await {
-        let deps = Arc::clone(&deps);
-        tokio::spawn(async move {
+pub async fn accept_h3_loop(
+    endpoint: quinn::Endpoint,
+    deps: Arc<H3Deps>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    shutdown_rx.borrow_and_update();
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    break;
+                };
+                let deps = Arc::clone(&deps);
+                tokio::spawn(async move {
             let conn = match incoming.await {
                 Ok(c) => c,
                 Err(e) => {
@@ -128,7 +144,13 @@ pub async fn accept_h3_loop(endpoint: quinn::Endpoint, deps: Arc<H3Deps>) {
                     }
                 }
             }
-        });
+                });
+            }
+            _ = shutdown_rx.changed() => {
+                endpoint.close(0u32.into(), b"shutdown");
+                break;
+            }
+        }
     }
 }
 
@@ -176,7 +198,14 @@ async fn handle_h3_request(
     .with_compression(deps.compression_enabled)
     .with_max_request_body(deps.max_request_body_bytes)
     .with_upstream_timeout(deps.upstream_timeout_secs)
+    .with_admission_counter(Arc::clone(&deps.inflight_requests))
+    .with_probe_state(deps.probe_state.clone())
     .with_connection_extensions(connection_extensions);
+    svc = svc.with_reliability_config(&crate::config::ReliabilityConfig {
+        max_inflight_requests: deps.max_inflight_requests.map(|value| value as u32),
+        brownout_inflight_requests: deps.brownout_inflight_requests.map(|value| value as u32),
+        retry_budget_per_request: deps.retry_budget_per_request as u32,
+    });
 
     if let Some(ref rl) = deps.rate_limiter {
         svc = svc.with_rate_limiter(rl.clone());
@@ -411,18 +440,24 @@ mod tests {
         )]);
         let router = Arc::new(ArcSwap::from_pointee(router));
         let counter = Arc::new(AtomicUsize::new(0));
+        let inflight_requests = Arc::new(AtomicUsize::new(0));
         let client = build_client();
         let (certs, key) = tls::generate_self_signed_cert(&["localhost"]).unwrap();
         let cert = certs[0].clone();
         let quic_config = tls::build_quic_server_config(certs, key).unwrap();
         let endpoint = build_quic_endpoint("127.0.0.1:0".parse().unwrap(), quic_config).unwrap();
         let addr = endpoint.local_addr().unwrap();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let deps = Arc::new(H3Deps {
             router,
             client,
             counter,
+            inflight_requests,
             health_state: None,
             upstream_timeout_secs,
+            retry_budget_per_request: 2,
+            brownout_inflight_requests: None,
+            max_inflight_requests: None,
             rate_limiter: None,
             metrics: None,
             circuit_breaker: None,
@@ -430,8 +465,9 @@ mod tests {
             plugins,
             compression_enabled: false,
             max_request_body_bytes: 1024 * 1024,
+            probe_state: ProbeState::new(),
         });
-        tokio::spawn(accept_h3_loop(endpoint, deps));
+        tokio::spawn(accept_h3_loop(endpoint, deps, shutdown_rx));
         tokio::task::yield_now().await;
         (addr, cert)
     }
